@@ -818,6 +818,32 @@ void probe_second_argument(red3lib::IScriptable* game, red3lib::Handle<void>& np
         << std::endl;
 }
 
+// A live class's PROPERTIES, including the scripted ones the dump cannot show.
+// Reads the name from CProperty +0x10.
+void dump_class_properties(const char* indent, red3lib::CClass* cls, int max_classes, int max_each)
+{
+    int depth = 0;
+    for (auto* c = cls; c && depth < max_classes; c = c->base, depth++)
+    {
+        auto class_name = c->name.to_wide();
+        out << indent << narrow(class_name.data(), static_cast<std::uint32_t>(class_name.size())) << "  ("
+            << c->properties.size << " properties)" << std::endl;
+
+        for (std::uint32_t i = 0; i < c->properties.size && static_cast<int>(i) < max_each; i++)
+        {
+            auto* property = c->properties.entries[i];
+            if (!property)
+            {
+                continue;
+            }
+
+            auto property_name = property->name.to_wide();
+            out << indent << "  " << narrow(property_name.data(), static_cast<std::uint32_t>(property_name.size()))
+                << " : " << type_name_of(property) << "  @" << property->offset << std::endl;
+        }
+    }
+}
+
 // One round of probes. Repeated as the game progresses: values that are zero at
 // the menu but populated in-world tell us the earlier run was simply too early,
 // rather than the marshalling being wrong.
@@ -1069,6 +1095,80 @@ void run_round(int round)
                     const auto allowed = method->call_scripted<bool>(hud_self);
                     out << "    -> " << std::boolalpha << allowed << std::endl;
                 }
+            }
+
+            // The dialogue channel.
+            //
+            // These are the HUD's own dialogue handlers, all scripted, so they
+            // only became reachable with call_scripted. A oneliner is a floating
+            // bark; these are the subtitle line at the bottom of the screen with
+            // a speaker - what an LLM layer actually wants.
+            //
+            // Ordered the way the game drives them: show the dialogue HUD, then
+            // set the sentence. Each is logged and flushed before the call, and
+            // each returns Bool so the handler's own answer is visible.
+            auto call_hud = [&](const wchar_t* name, auto&&... call_args) -> bool
+            {
+                auto* method = hud_class->find_function(name);
+                if (!method || method->is_native() ||
+                    method->params.size != sizeof...(call_args))
+                {
+                    out << "    [skip] " << narrow(name, static_cast<std::uint32_t>(wcslen(name)))
+                        << " missing or wrong shape" << std::endl;
+                    return false;
+                }
+
+                out << "    calling " << narrow(name, static_cast<std::uint32_t>(wcslen(name))) << " ..."
+                    << std::endl;
+
+                const auto answer = method->call_scripted<bool>(hud_self, std::forward<decltype(call_args)>(call_args)...);
+                out << "      -> " << std::boolalpha << answer << std::endl;
+                return answer;
+            };
+
+            static bool dialogue_tried = false;
+            if (!dialogue_tried)
+            {
+                dialogue_tried = true;
+
+                out << "  dialogue channel:" << std::endl;
+
+                // Why would the handlers decline? Ask the HUD directly rather
+                // than guess: if the dialogue module does not exist, they have
+                // nothing to write into.
+                if (auto* method = hud_class->find_function(L"GetDialogModule"))
+                {
+                    if (!method->is_native() && method->params.size == 0)
+                    {
+                        out << "    calling GetDialogModule ..." << std::endl;
+                        auto module = method->call_scripted<red3lib::Handle<void>>(hud_self);
+                        out << "      -> handle " << static_cast<const void*>(module.block) << "  object "
+                            << static_cast<const void*>(module.get()) << std::endl;
+
+                        if (auto* module_class = module.get() ? red3lib::class_of(module.get()) : nullptr)
+                        {
+                            auto module_name = module_class->name.to_wide();
+                            out << "      class = "
+                                << narrow(module_name.data(), static_cast<std::uint32_t>(module_name.size()))
+                                << std::endl;
+                        }
+                    }
+                }
+
+                out << "    HUD properties (module fields live here):" << std::endl;
+                dump_class_properties("      ", hud_class, 1, 40);
+
+                static wchar_t sentence[] = L"Geralt. There is something you should know.";
+                static wchar_t speaker[] = L"Yennefer";
+                static wchar_t subtitle[] = L"This line came from a C++ plugin.";
+
+                call_hud(L"OnDialogHudShow");
+                call_hud(L"OnDialogSentenceSet", red3lib::borrow_string(sentence), false);
+
+                // Four arguments, and the richest channel: an id, a speaker and
+                // the line. Also the widest multi-argument test yet.
+                call_hud(L"OnSubtitleAdded", std::int32_t{1}, red3lib::borrow_string(speaker),
+                         red3lib::borrow_string(subtitle), false);
             }
 
             // Discriminating: a scripted function whose result must vary with
@@ -1398,7 +1498,15 @@ void run_round(int round)
                                 probe_second_argument(g_context, *nearest);
                             }
 
-                            speak_oneliner(*nearest, who, nearest_distance);
+                            // Once. It is proven, and repeating it parks a
+                            // bark over whoever is nearest for the whole
+                            // session.
+                            static bool spoke_once = false;
+                            if (!spoke_once)
+                            {
+                                spoke_once = true;
+                                speak_oneliner(*nearest, who, nearest_distance);
+                            }
                         }
                     }
 
