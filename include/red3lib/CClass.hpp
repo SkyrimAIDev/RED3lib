@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include <red3lib/CNameHash.hpp>
@@ -71,4 +72,26 @@ RED3LIB_ASSERT_OFFSET(CClass, size, 0x60);
 RED3LIB_ASSERT_OFFSET(CClass, scripted_size, 0x64);
 RED3LIB_ASSERT_OFFSET(CClass, flags, 0x68);
 RED3LIB_ASSERT_OFFSET(CClass, alignment, 0x6C);
+
+// Every CObject-derived instance stores its own CClass at +0x18.
+//
+// Read out of the engine rather than assumed: vtable slot 1 of CObject,
+// CEntity, CActor, CNewNPC, CR4Player, CR4Game and CWitcherJournalManager is
+// the SAME one-instruction function, `mov rax, [rcx + 0x18] ; ret`. One shared
+// implementation across every class is what you get when the class pointer is
+// stored per object rather than returned per class. (Slot 0 is also shared but
+// returns a single fixed global, so it is not the class getter.)
+//
+// This is what makes find_function usable on an arbitrary object instead of
+// only on a class you already hold.
+[[nodiscard]] inline CClass* class_of(const void* object) noexcept
+{
+    constexpr std::size_t class_offset = 0x18;
+    if (!object)
+    {
+        return nullptr;
+    }
+
+    return *reinterpret_cast<CClass* const*>(static_cast<const std::uint8_t*>(object) + class_offset);
+}
 } // namespace red3lib

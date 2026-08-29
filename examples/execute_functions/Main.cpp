@@ -557,6 +557,39 @@ void run_round(int round)
         }
     }
 
+    // Calling a method on an object we did not start with.
+    //
+    // Every call so far has used the game's own class and instance. This takes
+    // the journal manager handle, reads its CClass from the object itself, and
+    // resolves and calls one of ITS methods - which is what makes the whole
+    // object graph reachable rather than just the game object.
+    if (auto* fn = resolve(g_class, L"GetJournalManager"))
+    {
+        auto handle = fn->call_native<red3lib::Handle<void>>(g_context);
+        auto* object = handle.get();
+        auto* cls = red3lib::class_of(object);
+
+        out << "  journal manager = " << static_cast<const void*>(object)
+            << "  its CClass = " << static_cast<const void*>(cls) << std::endl;
+
+        if (cls)
+        {
+            out << "    class size = " << cls->size << ", scripted size = " << cls->scripted_size << std::endl;
+
+            if (auto* method = cls->find_function(L"GetRegularQuestCount"))
+            {
+                out << "    resolved GetRegularQuestCount on its own class, native = " << std::boolalpha
+                    << method->is_native() << std::endl;
+                auto count = method->call_native<std::int32_t>(reinterpret_cast<red3lib::IScriptable*>(object));
+                out << "    GetRegularQuestCount() = " << count << std::endl;
+            }
+            else
+            {
+                out << "    GetRegularQuestCount not found - class_of returned the wrong class" << std::endl;
+            }
+        }
+    }
+
     if (auto* fn = resolve(g_class, L"GetEngineTimeAsSeconds"))
     {
         out << "  GetEngineTimeAsSeconds() = " << fn->call_native<float>(g_context) << "  (post-check)" << std::endl;
