@@ -37,6 +37,7 @@ jobs:
             -DCMAKE_CXX_STANDARD=${{ matrix.cpp-standard }} `
             -DRED3LIB_INSTALL=ON `
             -DRED3LIB_USE_PCH=OFF `
+            -DRED3LIB_BUILD_EXAMPLES=ON `
             -DRED3LIB_EXTRA_WARNINGS=ON `
             -DRED3LIB_TREAT_WARNINGS_AS_ERRORS=ON `
             ${{ github.workspace }}

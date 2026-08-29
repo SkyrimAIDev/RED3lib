@@ -2,7 +2,7 @@ add_library(RED3lib.ExecuteFunctions SHARED)
 
 set(
   RED3LIB_EXECUTE_FUNCTIONS_SRC_FILES
-    main.cpp
+    Main.cpp
 )
 
 source_group(
