@@ -982,6 +982,100 @@ private:
 
 dialogue_line g_dialogue;
 
+// CALL-IN: registering our own native with the engine.
+//
+// Both registrars were read out of the image. Neither publishes the function
+// anywhere - no class list, no global registry - they only initialise a
+// caller-provided CFunction, put the implementation in a dispatch table, and
+// assign registration_offset:
+//
+//   register_global(CFunction* storage, CNameHash* name, native_fn_t impl)
+//       [storage+0x14] = 3            flags: native | global
+//       global_table[counter] = impl
+//       [storage+0xA8] = counter++
+//
+//   register_method(CFunction* storage, CClass* owner, CNameHash* name,
+//                   member_entry* impl)
+//       [storage+0x14] = 1            flags: native, non-global
+//       class_table[counter] = the 24-byte entry
+//
+// Publishing is the caller's job - the ShowOneliner site appends the returned
+// CFunction* to owner->functions at +0x48 afterwards.
+//
+// A GLOBAL is the honest first milestone: it needs no class list surgery, and it
+// is verifiable without the script compiler, because call_native dispatches
+// globals through registration_offset into the very table the registrar just
+// wrote. If our own C++ runs and returns its value, the path is proven.
+std::int32_t g_ping_calls = 0;
+
+void red3lib_ping(red3lib::IScriptable*, red3lib::CStackFrame*, void* result)
+{
+    g_ping_calls++;
+
+    if (result)
+    {
+        *static_cast<std::int32_t*>(result) = 0x5ED3;
+    }
+}
+
+void probe_call_in()
+{
+    // Storage the engine does NOT own: the registrars take a caller-provided
+    // block and never free it. Static, so it outlives every call.
+    static std::uint8_t storage[0xC0] = {};
+    static bool registered = false;
+
+    if (registered)
+    {
+        return;
+    }
+
+    registered = true;
+
+    red3lib::CNameHash name(L"RED3lib_Ping");
+
+    red3lib::detail::RelocFunc<red3lib::CFunction*, void*, const red3lib::CNameHash*,
+                               red3lib::CFunction::native_fn_t>
+        register_global(red3lib::detail::addresses::CFunction::register_native);
+
+    out << "  call-in: registering RED3lib_Ping ..." << std::endl;
+
+    auto* fn = register_global(storage, &name, &red3lib_ping);
+
+    if (!fn)
+    {
+        out << "    registrar returned null" << std::endl;
+        return;
+    }
+
+    out << "    CFunction = " << static_cast<const void*>(fn) << "  flags=0x" << std::hex << fn->flags << std::dec
+        << "  regOffset=" << fn->registration_offset << "  global=" << std::boolalpha << fn->is_global()
+        << "  native=" << fn->is_native() << std::endl;
+
+    // Did the implementation actually land in the dispatch table at the index
+    // the registrar assigned? Read it straight back.
+    if (fn->registration_offset >= 0)
+    {
+        red3lib::detail::RelocArray<red3lib::CFunction::native_fn_t> table(
+            red3lib::detail::addresses::CFunction::native_table);
+        const auto* landed = reinterpret_cast<const void*>(table[static_cast<std::size_t>(fn->registration_offset)]);
+
+        out << "    table slot holds " << landed << ", ours is "
+            << reinterpret_cast<const void*>(&red3lib_ping)
+            << (landed == reinterpret_cast<const void*>(&red3lib_ping) ? "   <-- registered" : "   MISMATCH")
+            << std::endl;
+    }
+
+    // The round trip: call it back through the engine's own dispatch.
+    const auto before = g_ping_calls;
+    const auto answer = fn->call_native<std::int32_t>(nullptr);
+
+    out << "    called back through the engine: returned 0x" << std::hex << answer << std::dec << ", our function ran "
+        << (g_ping_calls - before) << " time(s)"
+        << ((answer == 0x5ED3 && g_ping_calls == before + 1) ? "   <-- CALL-IN WORKS" : "   <-- did not round trip")
+        << std::endl;
+}
+
 // One round of probes. Repeated as the game progresses: values that are zero at
 // the menu but populated in-world tell us the earlier run was simply too early,
 // rather than the marshalling being wrong.
@@ -1184,6 +1278,11 @@ void run_round(int round)
                 dump_signature("    ", narrowed.c_str(), fn);
             }
         }
+    }
+
+    if (first)
+    {
+        probe_call_in();
     }
 
     // Text output: what can actually put words on screen.
