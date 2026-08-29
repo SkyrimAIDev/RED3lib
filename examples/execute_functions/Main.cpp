@@ -527,15 +527,17 @@ void run_round(int round)
             << std::endl;
     }
 
-    // Do object returns work at all?
+    // Object returns, dereferenced properly.
     //
-    // GetPlayer came back null in every round even with the world live and
-    // engine time running, so it is not a timing artifact. These are other
-    // zero-argument natives on the same class chain that should be non-null
-    // in-world. If they return objects and GetPlayer alone does not, the return
-    // mechanism is fine and GetPlayer is the outlier; if they are all null,
-    // object returns do not work through call_native.
-    for (const wchar_t* name : {L"GetWorld", L"GetHud", L"GetJournalManager", L"GetPlayer"})
+    // Natives whose RTTI return type is CRTTIHandleType return a HANDLE - eight
+    // bytes pointing at a control block, with the object at +0x08 - not a raw
+    // object pointer. Reading the handle as an object reads its refcount as a
+    // vptr, which is what made these look broken.
+    //
+    // GetPlayer is deliberately absent: its return property is null, so RTTI
+    // says it returns nothing. It was only ever probed because the name implied
+    // an accessor.
+    for (const wchar_t* name : {L"GetWorld", L"GetHud", L"GetJournalManager"})
     {
         auto* fn = resolve(g_class, name);
         if (!fn)
@@ -543,12 +545,15 @@ void run_round(int round)
             continue;
         }
 
-        dump_meta(narrow(name, static_cast<std::uint32_t>(wcslen(name))).c_str(), fn);
-        auto* object = fn->call_native<void*>(g_context);
-        out << "  " << narrow(name, static_cast<std::uint32_t>(wcslen(name))) << "() = " << object << std::endl;
-        if (object)
+        auto narrowed = narrow(name, static_cast<std::uint32_t>(wcslen(name)));
+        dump_meta(narrowed.c_str(), fn);
+
+        auto handle = fn->call_native<red3lib::Handle<void>>(g_context);
+        out << "  " << narrowed << "() handle = " << static_cast<const void*>(handle.block)
+            << "  object = " << static_cast<const void*>(handle.get()) << std::endl;
+        if (handle)
         {
-            describe_object("    ", object);
+            describe_object("    ", handle.get());
         }
     }
 

@@ -64,6 +64,7 @@ set(
   RED3LIB_HEADER_FILES
     include/red3lib/RED3lib.hpp
 
+    include/red3lib/Handle.hpp
     include/red3lib/String.hpp
 
     include/red3lib/CNameHash.hpp

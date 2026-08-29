@@ -10,6 +10,7 @@
 #include <red3lib/CNameHash.hpp>
 #include <red3lib/CStackFrame.hpp>
 #include <red3lib/CStackFrameWriter.hpp>
+#include <red3lib/Handle.hpp>
 #include <red3lib/IRTTIBaseObject.hpp>
 #include <red3lib/containers/TDynArray.hpp>
 #include <red3lib/detail/Addresses.hpp>
@@ -92,10 +93,13 @@ struct CFunction : IRTTIBaseObject
         return (flags & is_native_flag) == is_native_flag;
     }
 
-    CClass* owner;                    // 08
-    red3lib::CNameHash name;          // 10
-    std::int32_t flags;               // 14
-    std::int64_t return_type;         // 18
+    CClass* owner;           // 08
+    red3lib::CNameHash name; // 10
+    std::int32_t flags;      // 14
+    // Describes the return value, exactly like the entries in `params`;
+    // null when the function returns nothing. Its `type` names the RTTI
+    // type - CRTTIHandleType for anything returning an object.
+    CProperty* return_property;       // 18
     TDynArray<CProperty*> params;     // 20
     TDynArray<CProperty*> locals;     // 2C
     std::int64_t unk38;               // 38
@@ -122,7 +126,7 @@ RED3LIB_ASSERT_SIZE(CFunction, 0xC0);
 RED3LIB_ASSERT_OFFSET(CFunction, owner, 0x8);
 RED3LIB_ASSERT_OFFSET(CFunction, name, 0x10);
 RED3LIB_ASSERT_OFFSET(CFunction, flags, 0x14);
-RED3LIB_ASSERT_OFFSET(CFunction, return_type, 0x18);
+RED3LIB_ASSERT_OFFSET(CFunction, return_property, 0x18);
 RED3LIB_ASSERT_OFFSET(CFunction, params, 0x20);
 RED3LIB_ASSERT_OFFSET(CFunction, locals, 0x2C);
 RED3LIB_ASSERT_OFFSET(CFunction, registration_offset, 0xA8);
