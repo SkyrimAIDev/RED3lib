@@ -273,6 +273,83 @@ std::vector<void**> find_instance_slots(const void* vtable, std::size_t limit)
     return found;
 }
 
+// Primary vtables, RTTI-derived (python w3offsets.py --classes CR4Player ...).
+// An object's vptr names its most-derived NATIVE class - a script class such as
+// W3PlayerWitcher is instantiated on its nearest native base and carries that
+// base's vptr, so CR4Player is what a player object reports.
+struct known_class
+{
+    const char* name;
+    std::uintptr_t vtable_offset;
+};
+
+constexpr known_class known_classes[] = {
+    {"CR4Player", 0x2d71520}, {"CPlayer", 0x2b3fea8}, {"CNewNPC", 0x2b4bd68},
+    {"CActor", 0x2b3ce38},    {"CEntity", 0x2a211a8}, {"CR4Game", 0x2d0ee38},
+};
+
+// A returned pointer is engine-controlled and might be a handle, a null, or
+// something unmapped - check before dereferencing it.
+bool readable(const void* address, std::size_t size)
+{
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) == 0)
+    {
+        return false;
+    }
+
+    constexpr DWORD ok = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY;
+    if (info.State != MEM_COMMIT || (info.Protect & ok) == 0 || (info.Protect & PAGE_GUARD) != 0)
+    {
+        return false;
+    }
+
+    const auto* begin = static_cast<const std::uint8_t*>(info.BaseAddress);
+    return static_cast<const std::uint8_t*>(address) + size <= begin + info.RegionSize;
+}
+
+// Report what an engine-returned object actually is, using the CEntity field
+// offsets the RTTI dump gives us.
+void describe_object(const char* indent, void* object)
+{
+    if (!object || !readable(object, 512))
+    {
+        out << indent << "not a readable object" << std::endl;
+        return;
+    }
+
+    auto* base = reinterpret_cast<std::uint8_t*>(GetModuleHandle(nullptr));
+    auto* vptr = *reinterpret_cast<std::uint8_t**>(object);
+
+    const char* name = "<not a known class>";
+    for (const auto& kc : known_classes)
+    {
+        if (vptr == base + kc.vtable_offset)
+        {
+            name = kc.name;
+            break;
+        }
+    }
+
+    out << indent << "vptr = " << static_cast<void*>(vptr) << "  (image+0x" << std::hex
+        << static_cast<std::size_t>(vptr - base) << std::dec << ")  class = " << name << std::endl;
+
+    auto* bytes = reinterpret_cast<std::uint8_t*>(object);
+    bool guid_set = false;
+    for (int i = 0; i < 16; i++)
+    {
+        if (bytes[204 + i])
+        {
+            guid_set = true;
+        }
+    }
+
+    const auto& tags = *reinterpret_cast<red3lib::TDynArray<void*>*>(bytes + 192);
+    out << indent << "guid set = " << std::boolalpha << guid_set << ", tags = { entries "
+        << static_cast<const void*>(tags.entries) << ", count " << tags.size << " }" << std::endl;
+}
+
 // Dump the raw 12 bytes as well as the decoded text. The byte view is the point
 // of the exercise: it shows the field order directly, and whether "size"
 // includes the terminating null.
@@ -450,6 +527,31 @@ void run_round(int round)
             << std::endl;
     }
 
+    // Do object returns work at all?
+    //
+    // GetPlayer came back null in every round even with the world live and
+    // engine time running, so it is not a timing artifact. These are other
+    // zero-argument natives on the same class chain that should be non-null
+    // in-world. If they return objects and GetPlayer alone does not, the return
+    // mechanism is fine and GetPlayer is the outlier; if they are all null,
+    // object returns do not work through call_native.
+    for (const wchar_t* name : {L"GetWorld", L"GetHud", L"GetJournalManager", L"GetPlayer"})
+    {
+        auto* fn = resolve(g_class, name);
+        if (!fn)
+        {
+            continue;
+        }
+
+        dump_meta(narrow(name, static_cast<std::uint32_t>(wcslen(name))).c_str(), fn);
+        auto* object = fn->call_native<void*>(g_context);
+        out << "  " << narrow(name, static_cast<std::uint32_t>(wcslen(name))) << "() = " << object << std::endl;
+        if (object)
+        {
+            describe_object("    ", object);
+        }
+    }
+
     if (auto* fn = resolve(g_class, L"GetEngineTimeAsSeconds"))
     {
         out << "  GetEngineTimeAsSeconds() = " << fn->call_native<float>(g_context) << "  (post-check)" << std::endl;
@@ -486,7 +588,7 @@ RED3LIB_C_EXPORT void RED3LIB_CALL Update()
     // native legitimately had nothing to return. Rounds spanning menu, load and
     // in-world distinguish "too early" from "marshalling is wrong".
     constexpr int frames_between_rounds = 300;
-    constexpr int max_rounds = 15;
+    constexpr int max_rounds = 4;
     constexpr int max_scans = 40;
 
     static int frame = 0;
