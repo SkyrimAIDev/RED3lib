@@ -650,15 +650,24 @@ void find_property_name_offset(red3lib::CClass* cls)
 // ShowOneliner tolerates a null entity - it dispatches anyway - so an argument
 // that never arrives is indistinguishable from a call that did nothing.
 //
-// Rather than pick a function by name, scan for one with the right SHAPE: one
-// handle parameter, a non-void return, and a Get/Is/Has name so it only reads.
-// A result that varies with the handle can only come from the handle arriving.
+// The first attempt tested ONE function, IsDangerous, and got 0 for a real
+// handle, a null handle and a different handle. That proves nothing: false is a
+// perfectly good answer for all three. Betting on a single function was the
+// mistake, so this tries every candidate of the right SHAPE - one handle
+// parameter, non-void return, a read-only name - until one of them answers
+// differently. Only a DIFFERENCE is evidence; identical results stay silent.
+//
+// Each name is logged and flushed BEFORE the call, so if one of these natives
+// takes the game down, the log names it.
 void probe_handle_argument(red3lib::CClass* cls, red3lib::IScriptable* context, red3lib::Handle<void>& subject,
                            red3lib::Handle<void>& other)
 {
-    for (auto* c = cls; c; c = c->base)
+    int tried = 0;
+    bool discriminated = false;
+
+    for (auto* c = cls; c && tried < 14; c = c->base)
     {
-        for (std::uint32_t i = 0; i < c->functions.size; i++)
+        for (std::uint32_t i = 0; i < c->functions.size && tried < 14; i++)
         {
             auto* fn = c->functions.entries[i];
             if (!fn || !fn->is_native() || fn->params.size != 1 || !fn->return_property)
@@ -668,53 +677,132 @@ void probe_handle_argument(red3lib::CClass* cls, red3lib::IScriptable* context, 
 
             auto* param = fn->param_type(0);
             auto* returns = fn->return_property->type;
-            if (!param || !returns || param->size() != sizeof(red3lib::Handle<void>))
+            if (!param || !returns || param->size() != sizeof(red3lib::Handle<void>) ||
+                returns->size() > sizeof(std::uint64_t))
             {
                 continue;
             }
 
             const auto* param_name = param->name();
-            if (!param_name)
-            {
-                continue;
-            }
-
-            auto param_text = param_name->to_wide();
-            if (param_text.rfind(L"handle:", 0) != 0)
+            if (!param_name || param_name->to_wide().rfind(L"handle:", 0) != 0)
             {
                 continue;
             }
 
             auto fn_text = fn->name.to_wide();
-            if (fn_text.rfind(L"Get", 0) != 0 && fn_text.rfind(L"Is", 0) != 0 && fn_text.rfind(L"Has", 0) != 0)
+            if (fn_text.rfind(L"Get", 0) != 0 && fn_text.rfind(L"Is", 0) != 0 && fn_text.rfind(L"Has", 0) != 0 &&
+                fn_text.rfind(L"Can", 0) != 0)
             {
                 continue;
             }
 
-            // Only types small enough to read back as a plain value.
-            if (returns->size() > sizeof(std::uint64_t))
-            {
-                continue;
-            }
+            tried++;
 
             auto narrowed = narrow(fn_text.data(), static_cast<std::uint32_t>(fn_text.size()));
-            dump_signature("    ", narrowed.c_str(), fn);
+            out << "    trying " << narrowed << " ..." << std::endl;
 
             red3lib::Handle<void> nothing{};
-            const auto with_subject = fn->call_native<std::uint64_t>(context, subject);
-            const auto with_null = fn->call_native<std::uint64_t>(context, nothing);
-            const auto with_other = fn->call_native<std::uint64_t>(context, other);
+            const auto a = fn->call_native<std::uint64_t>(context, subject);
+            const auto b = fn->call_native<std::uint64_t>(context, nothing);
+            const auto d = fn->call_native<std::uint64_t>(context, other);
 
-            out << "      subject=" << with_subject << "  null=" << with_null << "  other=" << with_other;
-            out << ((with_subject != with_null || with_other != with_null)
-                        ? "   <-- the handle IS delivered"
-                        : "   (identical - proves nothing)")
-                << std::endl;
-            return;
+            const bool differs = a != b || d != b;
+            discriminated = discriminated || differs;
+
+            out << "      subject=0x" << std::hex << a << "  null=0x" << b << "  other=0x" << d << std::dec
+                << (differs ? "   <-- DIFFERS, the handle IS delivered" : "   (identical)") << std::endl;
+
+            if (differs)
+            {
+                return;
+            }
         }
     }
 
-    out << "    no single-handle read-only native found to test with" << std::endl;
+    out << "    tried " << tried << " candidates, none discriminated - handle delivery still unproven"
+        << std::endl;
+    (void)discriminated;
+}
+
+// Is a SECOND argument delivered?
+//
+// CanStealOtherActor settled handles: a real one returns 1, null returns 0. But
+// every argument ever proven has been the FIRST - Pause's String at offset 0,
+// GetTimeScale's bool at 0, CanStealOtherActor's handle at 0. The only
+// two-argument test so far, IsSpecificRumbleActive(0, 0), returned false, which
+// reads the same whether or not the second float arrived.
+//
+// ShowOneliner needs its entity as the SECOND argument, at offset 16, and a
+// second argument that never lands means a null speaker - exactly the silent
+// failure being chased. So this varies the SECOND argument only, holding the
+// first at zero, and looks for a difference.
+void probe_second_argument(red3lib::CClass* cls, red3lib::IScriptable* context, red3lib::Handle<void>& subject,
+                           red3lib::Handle<void>& other)
+{
+    int tried = 0;
+
+    for (auto* c = cls; c && tried < 14; c = c->base)
+    {
+        for (std::uint32_t i = 0; i < c->functions.size && tried < 14; i++)
+        {
+            auto* fn = c->functions.entries[i];
+            if (!fn || !fn->is_native() || fn->params.size != 2 || !fn->return_property)
+            {
+                continue;
+            }
+
+            auto* first = fn->param_type(0);
+            auto* second = fn->param_type(1);
+            auto* returns = fn->return_property->type;
+            if (!first || !second || !returns || returns->size() > sizeof(std::uint64_t))
+            {
+                continue;
+            }
+
+            // The second must be the handle; the first must be something small
+            // enough to hand a zero to.
+            const auto* second_name = second->name();
+            if (!second_name || second_name->to_wide().rfind(L"handle:", 0) != 0)
+            {
+                continue;
+            }
+
+            if (first->size() > sizeof(std::uint32_t))
+            {
+                continue;
+            }
+
+            auto fn_text = fn->name.to_wide();
+            if (fn_text.rfind(L"Get", 0) != 0 && fn_text.rfind(L"Is", 0) != 0 && fn_text.rfind(L"Has", 0) != 0 &&
+                fn_text.rfind(L"Can", 0) != 0)
+            {
+                continue;
+            }
+
+            tried++;
+
+            auto narrowed = narrow(fn_text.data(), static_cast<std::uint32_t>(fn_text.size()));
+            out << "    trying " << narrowed << " (handle is arg 2, at offset " << fn->params.entries[1]->offset
+                << ") ..." << std::endl;
+
+            red3lib::Handle<void> nothing{};
+            const std::uint32_t zero = 0;
+            const auto a = fn->call_native<std::uint64_t>(context, zero, subject);
+            const auto b = fn->call_native<std::uint64_t>(context, zero, nothing);
+            const auto d = fn->call_native<std::uint64_t>(context, zero, other);
+
+            const bool differs = a != b || d != b;
+            out << "      subject=0x" << std::hex << a << "  null=0x" << b << "  other=0x" << d << std::dec
+                << (differs ? "   <-- DIFFERS, the SECOND argument IS delivered" : "   (identical)") << std::endl;
+
+            if (differs)
+            {
+                return;
+            }
+        }
+    }
+
+    out << "    tried " << tried << " two-argument candidates, none discriminated" << std::endl;
 }
 
 // One round of probes. Repeated as the game progresses: values that are zero at
@@ -1253,6 +1341,9 @@ void run_round(int round)
                                 // and the handle argument is the player.
                                 auto* npc_context = reinterpret_cast<red3lib::IScriptable*>(nearest->get());
                                 probe_handle_argument(npc_class, npc_context, player_handle, *nearest);
+
+                                out << "  second-argument control:" << std::endl;
+                                probe_second_argument(npc_class, npc_context, player_handle, *nearest);
                             }
 
                             speak_oneliner(*nearest, who, nearest_distance);
