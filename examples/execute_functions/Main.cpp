@@ -724,85 +724,92 @@ void probe_handle_argument(red3lib::CClass* cls, red3lib::IScriptable* context, 
     (void)discriminated;
 }
 
-// Is a SECOND argument delivered?
+// Is a SECOND argument delivered? Settled with a signature we already know.
 //
-// CanStealOtherActor settled handles: a real one returns 1, null returns 0. But
-// every argument ever proven has been the FIRST - Pause's String at offset 0,
-// GetTimeScale's bool at 0, CanStealOtherActor's handle at 0. The only
-// two-argument test so far, IsSpecificRumbleActive(0, 0), returned false, which
-// reads the same whether or not the second float arrived.
+// Scanning for a function of the right shape found none - actors have no native
+// taking a small first argument and a handle second - so this stops hunting and
+// uses GetNPCsByTag(CName @0, array @4), whose signature was read from the live
+// CFunction earlier.
 //
-// ShowOneliner needs its entity as the SECOND argument, at offset 16, and a
-// second argument that never lands means a null speaker - exactly the silent
-// failure being chased. So this varies the SECOND argument only, holding the
-// first at zero, and looks for a difference.
-void probe_second_argument(red3lib::CClass* cls, red3lib::IScriptable* context, red3lib::Handle<void>& subject,
-                           red3lib::Handle<void>& other)
+// It discriminates by construction. Called with a tag an NPC really carries it
+// must return entries; called with a tag nothing carries it must return none.
+// Filling the array at offset 4 also means the ENGINE located a second
+// parameter's offset, which is the same mechanism ShowOneliner needs to find its
+// entity at offset 16.
+void probe_second_argument(red3lib::IScriptable* game, red3lib::Handle<void>& npc)
 {
-    int tried = 0;
-
-    for (auto* c = cls; c && tried < 14; c = c->base)
+    auto* by_tag = resolve(g_class, L"GetNPCsByTag");
+    if (!by_tag || by_tag->params.size != 2)
     {
-        for (std::uint32_t i = 0; i < c->functions.size && tried < 14; i++)
+        out << "    GetNPCsByTag unavailable" << std::endl;
+        return;
+    }
+
+    auto* npc_class = red3lib::class_of(npc.get());
+    auto* tags_fn = npc_class ? npc_class->find_function(L"GetTagsString") : nullptr;
+    if (!tags_fn || !tags_fn->is_native())
+    {
+        out << "    cannot read the NPC's tags" << std::endl;
+        return;
+    }
+
+    red3lib::owned<red3lib::String> tags(tags_fn->return_type(),
+                                        tags_fn->call_native<red3lib::String>(
+                                            reinterpret_cast<red3lib::IScriptable*>(npc.get())));
+    if (!tags->data)
+    {
+        out << "    the NPC has no tags to search by" << std::endl;
+        return;
+    }
+
+    // Tags print as "[ ONE; TWO ]" - take the first.
+    std::wstring first;
+    for (std::uint32_t i = 0; i < tags->size && tags->data[i]; i++)
+    {
+        const auto ch = tags->data[i];
+        const bool word = (ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z') || (ch >= L'0' && ch <= L'9') ||
+                          ch == L'_';
+        if (word)
         {
-            auto* fn = c->functions.entries[i];
-            if (!fn || !fn->is_native() || fn->params.size != 2 || !fn->return_property)
-            {
-                continue;
-            }
-
-            auto* first = fn->param_type(0);
-            auto* second = fn->param_type(1);
-            auto* returns = fn->return_property->type;
-            if (!first || !second || !returns || returns->size() > sizeof(std::uint64_t))
-            {
-                continue;
-            }
-
-            // The second must be the handle; the first must be something small
-            // enough to hand a zero to.
-            const auto* second_name = second->name();
-            if (!second_name || second_name->to_wide().rfind(L"handle:", 0) != 0)
-            {
-                continue;
-            }
-
-            if (first->size() > sizeof(std::uint32_t))
-            {
-                continue;
-            }
-
-            auto fn_text = fn->name.to_wide();
-            if (fn_text.rfind(L"Get", 0) != 0 && fn_text.rfind(L"Is", 0) != 0 && fn_text.rfind(L"Has", 0) != 0 &&
-                fn_text.rfind(L"Can", 0) != 0)
-            {
-                continue;
-            }
-
-            tried++;
-
-            auto narrowed = narrow(fn_text.data(), static_cast<std::uint32_t>(fn_text.size()));
-            out << "    trying " << narrowed << " (handle is arg 2, at offset " << fn->params.entries[1]->offset
-                << ") ..." << std::endl;
-
-            red3lib::Handle<void> nothing{};
-            const std::uint32_t zero = 0;
-            const auto a = fn->call_native<std::uint64_t>(context, zero, subject);
-            const auto b = fn->call_native<std::uint64_t>(context, zero, nothing);
-            const auto d = fn->call_native<std::uint64_t>(context, zero, other);
-
-            const bool differs = a != b || d != b;
-            out << "      subject=0x" << std::hex << a << "  null=0x" << b << "  other=0x" << d << std::dec
-                << (differs ? "   <-- DIFFERS, the SECOND argument IS delivered" : "   (identical)") << std::endl;
-
-            if (differs)
-            {
-                return;
-            }
+            first.push_back(ch);
+        }
+        else if (!first.empty())
+        {
+            break;
         }
     }
 
-    out << "    tried " << tried << " two-argument candidates, none discriminated" << std::endl;
+    if (first.empty())
+    {
+        out << "    no usable tag in " << narrow(tags->data, tags->size ? tags->size - 1 : 0) << std::endl;
+        return;
+    }
+
+    out << "    tag = " << narrow(first.c_str(), static_cast<std::uint32_t>(first.size())) << std::endl;
+
+    auto run = [&](const wchar_t* text, const char* label)
+    {
+        red3lib::CNameHash name(text);
+        red3lib::TDynArray<red3lib::Handle<void>> found{};
+        by_tag->call_native<void>(game, name, found);
+
+        out << "      " << label << " -> " << found.size << " NPC(s)" << std::endl;
+
+        const auto count = found.size;
+        if (auto* type = by_tag->param_type(1))
+        {
+            type->destruct(&found);
+        }
+
+        return count;
+    };
+
+    const auto real = run(first.c_str(), "real tag      ");
+    const auto bogus = run(L"RED3LIB_NO_SUCH_TAG", "nonsense tag  ");
+
+    out << "      " << (real > 0 && bogus == 0 ? "the SECOND argument IS delivered"
+                                               : "inconclusive - both answers are the same")
+        << std::endl;
 }
 
 // One round of probes. Repeated as the game progresses: values that are zero at
@@ -812,11 +819,31 @@ void run_round(int round)
 {
     out << "\n--- round " << round << " ---" << std::endl;
 
-    // Anything that cannot change between rounds, and anything that MUTATES
-    // game state, runs once. The rounds exist to watch state appear as the
-    // game loads - repeating the rest just leaks engine allocations and, in
-    // the case of Pause/Unpause, pokes a live session every few seconds.
-    const bool first = round == 1;
+    // Do nothing at all until a world is loaded.
+    //
+    // Everything below is diagnostics, and running it during startup - while the
+    // intro video plays and the engine is still assembling itself - is risk with
+    // no benefit, because the answers it produces there are already known. Two
+    // abnormal terminations happened in exactly that window, with the player
+    // null in every round of both. That is not proof the plugin caused them, but
+    // there is nothing here worth doing before the world exists.
+    {
+        auto& player_handle = *reinterpret_cast<red3lib::Handle<void>*>(
+            reinterpret_cast<std::uint8_t*>(g_context) + 48592);
+
+        if (!player_handle.get())
+        {
+            out << "  round " << round << ": no world yet, staying out of the way" << std::endl;
+            return;
+        }
+    }
+
+    // "First" now means the first round WITH a world, not the first tick.
+    // Anything that cannot change between rounds runs once; the rounds exist to
+    // watch live state, not to repeat settled proofs.
+    static bool done_static = false;
+    const bool first = !done_static;
+    done_static = true;
 
     if (auto* fn = resolve(g_class, L"GetEngineTimeAsSeconds"))
     {
@@ -842,36 +869,17 @@ void run_round(int round)
         out << "  GetTimeScale(true) = " << fn->call_native<float>(g_context, true) << std::endl;
     }
 
-    // A String argument, tested so the result actually discriminates.
+    // The Pause / IsPausedForReason / Unpause sequence used to run here. It
+    // proved String argument delivery - Pause keys on the string, so setting the
+    // state and reading it back could only agree if the content survived - and
+    // that question is settled.
     //
-    // IsPausedForReason returning false proves nothing: it is false whether or
-    // not the argument arrived, which is exactly what the broken encoding also
-    // produced. Pause keys on the string, so setting the state and reading it
-    // back can only agree if the content survived both calls. Unpause restores
-    // it either way.
-    if (auto* is_paused = first ? resolve(g_class, L"IsPausedForReason") : nullptr)
-    {
-        dump_meta("IsPausedForReason", is_paused);
-
-        static wchar_t reason[] = L"RED3lib";
-        auto arg = red3lib::borrow_string(reason); // sized the way the engine sizes its own
-
-        out << std::boolalpha << "  IsPausedForReason before = " << is_paused->call_native<bool>(g_context, arg)
-            << std::endl;
-
-        if (auto* pause = resolve(g_class, L"Pause"))
-        {
-            pause->call_native<void>(g_context, arg);
-            out << "  IsPausedForReason after Pause = " << is_paused->call_native<bool>(g_context, arg)
-                << "   <-- true proves the string content was delivered" << std::endl;
-        }
-
-        if (auto* unpause = resolve(g_class, L"Unpause"))
-        {
-            unpause->call_native<void>(g_context, arg);
-            out << "  IsPausedForReason after Unpause = " << is_paused->call_native<bool>(g_context, arg) << std::endl;
-        }
-    }
+    // It has been REMOVED rather than left in. It is the only probe that mutates
+    // game state, round 1 now lands during startup while the intro video plays,
+    // and pausing the game at that moment is risk with no remaining information
+    // to gain. Two abnormal terminations have happened around this point; that
+    // is not proof it was the cause, but a mutation that teaches us nothing is
+    // not worth defending.
 
     if (auto* fn = first ? resolve(g_class, L"IsSpecificRumbleActive") : nullptr)
     {
@@ -1343,7 +1351,7 @@ void run_round(int round)
                                 probe_handle_argument(npc_class, npc_context, player_handle, *nearest);
 
                                 out << "  second-argument control:" << std::endl;
-                                probe_second_argument(npc_class, npc_context, player_handle, *nearest);
+                                probe_second_argument(g_context, *nearest);
                             }
 
                             speak_oneliner(*nearest, who, nearest_distance);
