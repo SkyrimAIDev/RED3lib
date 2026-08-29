@@ -488,6 +488,33 @@ void dump_signature(const char* indent, const char* label, red3lib::CFunction* f
         << "]" << std::endl;
 }
 
+// Every function a class offers, including the scripted ones the RTTI dump
+// cannot show, with the signature read off each CFunction.
+void dump_class_functions(const char* indent, red3lib::CClass* cls, int max_classes)
+{
+    int depth = 0;
+    for (auto* c = cls; c && depth < max_classes; c = c->base, depth++)
+    {
+        auto class_name = c->name.to_wide();
+        out << indent << narrow(class_name.data(), static_cast<std::uint32_t>(class_name.size())) << "  ("
+            << c->functions.size << " functions)" << std::endl;
+
+        for (std::uint32_t i = 0; i < c->functions.size; i++)
+        {
+            auto* fn = c->functions.entries[i];
+            if (!fn)
+            {
+                continue;
+            }
+
+            auto fn_name = fn->name.to_wide();
+            auto narrowed = narrow(fn_name.data(), static_cast<std::uint32_t>(fn_name.size()));
+            out << indent << "  " << (fn->is_native() ? "native  " : "scripted ");
+            dump_signature("", narrowed.c_str(), fn);
+        }
+    }
+}
+
 red3lib::CClass* g_class = nullptr;
 red3lib::IScriptable* g_context = nullptr;
 
@@ -709,6 +736,78 @@ void run_round(int round)
             {
                 auto narrowed = narrow(name, static_cast<std::uint32_t>(wcslen(name)));
                 dump_signature("    ", narrowed.c_str(), fn);
+            }
+        }
+    }
+
+    // Text output: what can actually put words on screen.
+    //
+    // GetHud returns null at the main menu, which is why earlier rounds saw
+    // nothing - with a world loaded it hands back a CR4ScriptedHud. CR4Hud
+    // declares ShowOneliner natively, which is the floating line above an
+    // actor's head. The scripted subclass may offer more, and scripted methods
+    // are invisible to the RTTI dump, so this lists what the live class really
+    // has rather than what the dump knows.
+    if (auto* fn = resolve(g_class, L"GetHud"))
+    {
+        red3lib::owned<red3lib::Handle<void>> hud(fn->return_type(),
+                                                 fn->call_native<red3lib::Handle<void>>(g_context));
+
+        auto* hud_class = hud->get() ? red3lib::class_of(hud->get()) : nullptr;
+
+        static bool dumped_hud = false;
+        if (hud_class && !dumped_hud)
+        {
+            dumped_hud = true;
+
+            out << "  HUD class functions:" << std::endl;
+            dump_class_functions("    ", hud_class, 3);
+
+            if (auto* method = hud_class->find_function(L"ShowOneliner"))
+            {
+                out << "  ShowOneliner found, native = " << std::boolalpha << method->is_native() << std::endl;
+                dump_signature("    ", "ShowOneliner", method);
+            }
+        }
+
+        // Put words on screen.
+        //
+        // ShowOneliner is the floating line above an actor's head - the channel
+        // the game uses for its own barks, which is what an LLM layer would
+        // speak through. Both argument types are already proven: a String, as
+        // Pause takes, and an 8-byte handle.
+        //
+        // The scripted handlers on CR4ScriptedHud - OnCreateOneliner,
+        // OnDialogSentenceSet, OnSubtitleAdded - are richer, but they are
+        // SCRIPTED, and execute_scripted is still stale. Going through the
+        // native entry point lets the engine dispatch to them for us.
+        static bool spoke = false;
+        if (hud_class && !spoke)
+        {
+            auto* method = hud_class->find_function(L"ShowOneliner");
+            auto& player_handle = *reinterpret_cast<red3lib::Handle<void>*>(
+                reinterpret_cast<std::uint8_t*>(g_context) + 48592);
+
+            // Only call once the signature is confirmed to be what we can
+            // supply, rather than trusting the name.
+            const bool callable = method && method->is_native() && method->params.size == 2 &&
+                                  method->param_type(0) && method->param_type(1) &&
+                                  method->param_type(0)->size() == sizeof(red3lib::String) &&
+                                  method->param_type(1)->size() == sizeof(red3lib::Handle<void>);
+
+            if (callable && player_handle.get())
+            {
+                spoke = true;
+
+                static wchar_t line[] = L"RED3lib is speaking through the HUD.";
+                method->call_native<void>(reinterpret_cast<red3lib::IScriptable*>(hud->get()),
+                                          red3lib::borrow_string(line), player_handle);
+
+                out << "  ShowOneliner called on the player - look above Geralt's head" << std::endl;
+            }
+            else if (method && !callable)
+            {
+                out << "  ShowOneliner signature is not what we can supply; not calling" << std::endl;
             }
         }
     }
@@ -937,20 +1036,35 @@ void run_round(int round)
                     // The printed count includes the reference this array is
                     // holding, so what matters is that it stays CONSTANT across
                     // rounds, not its absolute value.
+                    // Pinning one NPC does not survive: the first attempt
+                    // tracked entries[0] and went quiet after two samples
+                    // because that NPC streamed out as the player moved. So
+                    // re-pick when the tracked one is gone, and say so - a
+                    // sample is only comparable with the ones before it if the
+                    // object is the same.
                     static void* tracked = nullptr;
-                    if (!tracked && npcs.size > 0)
-                    {
-                        tracked = npcs.entries[0].get();
-                    }
+                    const red3lib::Handle<void>* found = nullptr;
 
                     for (std::uint32_t i = 0; tracked && i < npcs.size; i++)
                     {
-                        if (npcs.entries[i].get() == tracked && npcs.entries[i].block)
+                        if (npcs.entries[i].get() == tracked)
                         {
-                            out << "      tracked NPC " << tracked
-                                << " refcount = " << npcs.entries[i].block->references << std::endl;
+                            found = &npcs.entries[i];
                             break;
                         }
+                    }
+
+                    if (!found && npcs.size > 0)
+                    {
+                        found = &npcs.entries[0];
+                        tracked = found->get();
+                        out << "      tracking NPC " << tracked << " (re-picked)" << std::endl;
+                    }
+
+                    if (found && found->block)
+                    {
+                        out << "      tracked NPC " << tracked << " refcount = " << found->block->references
+                            << std::endl;
                     }
 
                     // The array's storage, and a reference on every handle in
