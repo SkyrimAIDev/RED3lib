@@ -16,9 +16,12 @@ void red3lib::CStackFrameCodeWriter::write(CProperty* property)
 
     std::memcpy(m_cursor, &property, sizeof(property));
     m_cursor += sizeof(property);
+}
 
-    // The fetch loop advances once more after the handler returns; this byte is
-    // never read.
+void red3lib::CStackFrameCodeWriter::end()
+{
+    // One byte, after the last argument - the fetch loop steps over it exactly
+    // once regardless of how many arguments there were.
     *m_cursor = 0;
     m_cursor++;
 }

@@ -8,4 +8,5 @@ red3lib::CStackFrameWriter::CStackFrameWriter(const CStackFrame& stack_frame) no
 
 void red3lib::CStackFrameWriter::end_params()
 {
+    m_code.end();
 }

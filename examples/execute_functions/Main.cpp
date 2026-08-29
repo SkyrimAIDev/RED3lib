@@ -791,6 +791,12 @@ void probe_second_argument(red3lib::IScriptable* game, red3lib::Handle<void>& np
     {
         red3lib::CNameHash name(text);
         red3lib::TDynArray<red3lib::Handle<void>> found{};
+
+        // Logged and flushed BEFORE the call. This exact call took the game down
+        // when the second argument was being dropped, so if anything is still
+        // wrong the log says how far it got.
+        out << "      calling GetNPCsByTag with " << label << " ..." << std::endl;
+
         by_tag->call_native<void>(game, name, found);
 
         out << "      " << label << " -> " << found.size << " NPC(s)" << std::endl;

@@ -274,8 +274,10 @@ inline R CFunction::call_native(IScriptable* context, Args&&... args)
     std::memset(params_ptr, 0, params_size);
     std::unique_ptr<std::uint8_t, decltype(&_freea)> params_stack(params_ptr, &_freea);
 
-    // One load instruction per argument; +1 keeps it non-empty with no arguments.
-    constexpr auto code_size = CStackFrameCodeWriter::bytes_per_argument * sizeof...(Args) + 1;
+    // Nine bytes per argument, then one end-of-params byte - which also keeps
+    // the buffer non-empty when there are no arguments at all.
+    constexpr auto code_size = CStackFrameCodeWriter::bytes_per_argument * sizeof...(Args) +
+                               CStackFrameCodeWriter::bytes_after_arguments;
     std::array<std::uint8_t, code_size> code_stack{};
 
     CStackFrame frame(this, context, locals_stack.get(), params_stack.get(), code_stack.data());
