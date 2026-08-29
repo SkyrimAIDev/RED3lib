@@ -844,6 +844,144 @@ void dump_class_properties(const char* indent, red3lib::CClass* cls, int max_cla
     }
 }
 
+// The live HUD and its class, re-resolved on every use.
+//
+// Deliberately not cached: the HUD object does not survive a load, and holding a
+// pointer to it across frames means eventually calling into freed memory.
+bool current_hud(red3lib::owned<red3lib::Handle<void>>& handle, red3lib::CClass*& cls)
+{
+    cls = nullptr;
+
+    if (!g_class || !g_context)
+    {
+        return false;
+    }
+
+    auto* fn = g_class->find_function(L"GetHud");
+    if (!fn || !fn->is_native())
+    {
+        return false;
+    }
+
+    handle = red3lib::owned<red3lib::Handle<void>>(fn->return_type(),
+                                                  fn->call_native<red3lib::Handle<void>>(g_context));
+    if (!handle->get())
+    {
+        return false;
+    }
+
+    cls = red3lib::class_of(handle->get());
+    return cls != nullptr;
+}
+
+// Shows a dialogue line and - the part that matters - takes it back down.
+//
+// OnDialogSentenceSet renders text AND puts the HUD into conversation state,
+// which takes player control away. The game leaves that state when a real
+// dialogue ends; driving it directly means owning the exit too. An earlier
+// fire-once version showed a line and never hid it, and the player stayed locked
+// out until a reload.
+//
+// So teardown is not on the probe's schedule. It ticks every frame, ahead of
+// every early return in Update - including after the probes have finished, since
+// a line shown on the last round still has to come down.
+class dialogue_line
+{
+public:
+    void begin(const wchar_t* text, int hold_frames)
+    {
+        if (m_active)
+        {
+            return;
+        }
+
+        red3lib::owned<red3lib::Handle<void>> hud;
+        red3lib::CClass* hud_class = nullptr;
+        if (!current_hud(hud, hud_class))
+        {
+            out << "  dialogue: no HUD, not starting" << std::endl;
+            return;
+        }
+
+        // Armed BEFORE the first mutation, so a fault between the two calls
+        // still leaves something that will tear down.
+        m_active = true;
+        m_remaining = hold_frames > 0 ? hold_frames : 1;
+
+        auto* self = reinterpret_cast<red3lib::IScriptable*>(hud->get());
+        invoke(hud_class, self, L"OnDialogHudShow");
+
+        const auto length = static_cast<std::uint32_t>(wcslen(text) + 1);
+        invoke(hud_class, self, L"OnDialogSentenceSet",
+               red3lib::borrow_string(const_cast<wchar_t*>(text), length), false);
+
+        out << "  dialogue: shown, control held for " << m_remaining << " frames" << std::endl;
+    }
+
+    void tick()
+    {
+        if (!m_active || --m_remaining > 0)
+        {
+            return;
+        }
+
+        end();
+    }
+
+    void end()
+    {
+        if (!m_active)
+        {
+            return;
+        }
+
+        // Cleared FIRST: if a call below faults, this must not be retried every
+        // frame forever.
+        m_active = false;
+
+        red3lib::owned<red3lib::Handle<void>> hud;
+        red3lib::CClass* hud_class = nullptr;
+        if (!current_hud(hud, hud_class))
+        {
+            out << "  dialogue: HUD gone before teardown - a load already cleared it" << std::endl;
+            return;
+        }
+
+        auto* self = reinterpret_cast<red3lib::IScriptable*>(hud->get());
+        invoke(hud_class, self, L"OnDialogSentenceHide");
+        invoke(hud_class, self, L"OnDialogHudHide");
+
+        out << "  dialogue: hidden, control returned" << std::endl;
+    }
+
+    [[nodiscard]] bool active() const noexcept
+    {
+        return m_active;
+    }
+
+private:
+    template<typename... Args>
+    void invoke(red3lib::CClass* cls, red3lib::IScriptable* self, const wchar_t* name, Args&&... args)
+    {
+        auto* method = cls->find_function(name);
+        if (!method || method->is_native() || method->params.size != sizeof...(args))
+        {
+            out << "    [skip] " << narrow(name, static_cast<std::uint32_t>(wcslen(name))) << std::endl;
+            return;
+        }
+
+        // The Bool these return says whether the event was CONSUMED, not whether
+        // it acted - reading it as success or failure is what sent the first
+        // attempt off diagnosing a feature that was already working.
+        method->call_scripted<bool>(self, std::forward<Args>(args)...);
+    }
+
+    int m_remaining = 0;
+    bool m_active = false;
+};
+
+dialogue_line g_dialogue;
+
 // One round of probes. Repeated as the game progresses: values that are zero at
 // the menu but populated in-world tell us the earlier run was simply too early,
 // rather than the marshalling being wrong.
@@ -1126,7 +1264,17 @@ void run_round(int round)
                 return answer;
             };
 
-            // The dialogue channel WORKS, and is deliberately not driven here.
+            // The dialogue channel, driven with its full lifecycle. Roughly
+            // three seconds at 60fps - long enough to read, short enough that
+            // holding player control is not obnoxious.
+            static bool dialogue_started = false;
+            if (!dialogue_started)
+            {
+                dialogue_started = true;
+                g_dialogue.begin(L"Geralt. There is something you should know.", 180);
+            }
+
+            // The earlier fire-once version is gone.
             //
             // OnDialogSentenceSet put its line on screen. What it also did was
             // put the HUD into conversation state and take player control away,
@@ -1579,6 +1727,12 @@ RED3LIB_C_EXPORT void RED3LIB_CALL Update()
     static int scans = 0;
     static int rounds = 0;
     static bool finished = false;
+
+    // Every frame, ahead of every early return below - including the `finished`
+    // one. Its only job is handing player control back, so it must not be gated
+    // behind the round throttle or the end of the probe run: a line shown on the
+    // last round would otherwise stay up forever.
+    g_dialogue.tick();
 
     if (finished)
     {
