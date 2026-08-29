@@ -1126,50 +1126,24 @@ void run_round(int round)
                 return answer;
             };
 
-            static bool dialogue_tried = false;
-            if (!dialogue_tried)
-            {
-                dialogue_tried = true;
-
-                out << "  dialogue channel:" << std::endl;
-
-                // Why would the handlers decline? Ask the HUD directly rather
-                // than guess: if the dialogue module does not exist, they have
-                // nothing to write into.
-                if (auto* method = hud_class->find_function(L"GetDialogModule"))
-                {
-                    if (!method->is_native() && method->params.size == 0)
-                    {
-                        out << "    calling GetDialogModule ..." << std::endl;
-                        auto module = method->call_scripted<red3lib::Handle<void>>(hud_self);
-                        out << "      -> handle " << static_cast<const void*>(module.block) << "  object "
-                            << static_cast<const void*>(module.get()) << std::endl;
-
-                        if (auto* module_class = module.get() ? red3lib::class_of(module.get()) : nullptr)
-                        {
-                            auto module_name = module_class->name.to_wide();
-                            out << "      class = "
-                                << narrow(module_name.data(), static_cast<std::uint32_t>(module_name.size()))
-                                << std::endl;
-                        }
-                    }
-                }
-
-                out << "    HUD properties (module fields live here):" << std::endl;
-                dump_class_properties("      ", hud_class, 1, 40);
-
-                static wchar_t sentence[] = L"Geralt. There is something you should know.";
-                static wchar_t speaker[] = L"Yennefer";
-                static wchar_t subtitle[] = L"This line came from a C++ plugin.";
-
-                call_hud(L"OnDialogHudShow");
-                call_hud(L"OnDialogSentenceSet", red3lib::borrow_string(sentence), false);
-
-                // Four arguments, and the richest channel: an id, a speaker and
-                // the line. Also the widest multi-argument test yet.
-                call_hud(L"OnSubtitleAdded", std::int32_t{1}, red3lib::borrow_string(speaker),
-                         red3lib::borrow_string(subtitle), false);
-            }
+            // The dialogue channel WORKS, and is deliberately not driven here.
+            //
+            // OnDialogSentenceSet put its line on screen. What it also did was
+            // put the HUD into conversation state and take player control away,
+            // and it stays that way - the game normally leaves that state when a
+            // real dialogue ends, and there was no real dialogue behind it.
+            //
+            // The return values misled me. All three handlers returned false and
+            // I read that as "declined". A WitcherScript event handler returns
+            // true only when it CONSUMES the event; false says nothing about
+            // whether it acted. The line rendering is the only evidence that
+            // counted, and it contradicted the return value.
+            //
+            // Anything driving this has to own the whole sequence - show, set,
+            // then OnDialogSentenceHide and OnDialogHudHide to give control back
+            // - and must not be a fire-once probe that leaves the player stuck.
+            // A probe has no business holding the HUD hostage, so it is out
+            // until there is something to hand control back to.
 
             // Discriminating: a scripted function whose result must vary with
             // its arguments. Equal outputs for different inputs would mean the
