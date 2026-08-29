@@ -424,7 +424,7 @@ void run_round(int round)
         dump_meta("IsPausedForReason", is_paused);
 
         static wchar_t reason[] = L"RED3lib";
-        auto arg = red3lib::borrow_string(reason, static_cast<std::uint32_t>(std::size(reason) - 1));
+        auto arg = red3lib::borrow_string(reason); // sized the way the engine sizes its own
 
         out << std::boolalpha << "  IsPausedForReason before = " << is_paused->call_native<bool>(g_context, arg)
             << std::endl;

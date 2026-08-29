@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include <red3lib/detail/Asserts.hpp>
@@ -19,25 +20,37 @@ namespace red3lib
 //
 // That makes it structurally identical to TDynArray<wchar_t>.
 //
-// TODO: confirm whether "size" includes the terminating null. TODO: confirm
-// ownership - passing a String that borrows caller memory is expected to be
-// safe for a read-only parameter, but not if the callee retains or frees it.
+// "size" INCLUDES the terminating null. Read out of a live call:
+// GetApplicationVersion() returned size = 7 over the buffer
+// 'v' ' ' '4' '.' '0' '4' NUL - six visible characters and the null, counted.
+//
+// Ownership: the engine reads from a caller-owned buffer without retaining or
+// freeing it. Confirmed by passing a static buffer through Pause() and
+// IsPausedForReason() and getting a match back.
 #pragma pack(push, 4)
 struct [[nodiscard]] String
 {
     wchar_t* data;      // 00
-    std::uint32_t size; // 08 - wchar_t count, not bytes
+    std::uint32_t size; // 08 - wchar_t count INCLUDING the terminating null
 };
 #pragma pack(pop)
 RED3LIB_ASSERT_SIZE(String, 0xC);
 RED3LIB_ASSERT_OFFSET(String, data, 0x0);
 RED3LIB_ASSERT_OFFSET(String, size, 0x8);
 
-// Wrap caller-owned memory without copying. The buffer must outlive every use
-// of the returned String, and the engine must not take ownership of it - see
-// the ownership TODO above.
+// Wrap caller-owned memory without copying. `length` follows the engine's own
+// convention and counts the terminating null, so a null-terminated buffer of N
+// visible characters passes N + 1. The buffer must outlive every use of the
+// returned String.
 [[nodiscard]] constexpr String borrow_string(wchar_t* text, std::uint32_t length) noexcept
 {
     return String{text, length};
+}
+
+// Same, for a null-terminated array, sizing it the way the engine does.
+template<std::size_t N>
+[[nodiscard]] constexpr String borrow_string(wchar_t (&text)[N]) noexcept
+{
+    return String{text, static_cast<std::uint32_t>(N)};
 }
 } // namespace red3lib
