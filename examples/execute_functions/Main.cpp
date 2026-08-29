@@ -520,6 +520,48 @@ red3lib::IScriptable* g_context = nullptr;
 
 // Locate the class and the live instance. Cached: the address-space scan is
 // expensive and must not be repeated once it has succeeded.
+// Are we registered before scripts compile?
+//
+// The compiler binds `import function` by name at script-compile time, so a
+// native registered afterwards is invisible to WitcherScript no matter how
+// correct the registration is. Rather than trace the call graph, measure the
+// ordering directly: scripted functions are ATTACHED TO CLASSES when scripts
+// compile, so a class carrying none yet means the compiler has not run.
+//
+// CR4Game is the witness. In-world its class chain shows scripted subclasses
+// like W3PlayerWitcher and 104 scripted functions on CR4ScriptedHud; if at
+// plugin-load time its own class has zero scripted functions, we are ahead of
+// the compiler.
+void snapshot_script_state(const char* when)
+{
+    red3lib::detail::RelocPtr<red3lib::CClass> game_class(cr4game_class_offset);
+
+    if (game_class == nullptr || !readable(game_class.get(), sizeof(red3lib::CClass)))
+    {
+        out << "  [" << when << "] CR4Game class not constructed yet" << std::endl;
+        return;
+    }
+
+    auto* cls = game_class.get();
+    std::uint32_t native = 0;
+    std::uint32_t scripted = 0;
+
+    for (std::uint32_t i = 0; i < cls->functions.size; i++)
+    {
+        auto* fn = cls->functions.entries[i];
+        if (!fn || !readable(fn, sizeof(red3lib::CFunction)))
+        {
+            continue;
+        }
+
+        (fn->is_native() ? native : scripted)++;
+    }
+
+    out << "  [" << when << "] CR4Game class " << static_cast<const void*>(cls) << ": " << cls->functions.size
+        << " functions (" << native << " native, " << scripted << " scripted), " << cls->properties.size
+        << " properties" << std::endl;
+}
+
 bool locate()
 {
     if (g_class && g_context)
@@ -1072,8 +1114,63 @@ void probe_call_in()
 
     out << "    called back through the engine: returned 0x" << std::hex << answer << std::dec << ", our function ran "
         << (g_ping_calls - before) << " time(s)"
-        << ((answer == 0x5ED3 && g_ping_calls == before + 1) ? "   <-- CALL-IN WORKS" : "   <-- did not round trip")
+        << ((answer == 0x5ED3 && g_ping_calls == before + 1) ? "   <-- dispatch works" : "   <-- did not round trip")
         << std::endl;
+
+    // PUBLISH. The registrar wrote the dispatch table but published nothing, and
+    // the script compiler resolves `import function` through a separate
+    // registry - a native missing from it fails compilation outright with
+    // "Global native function '%ls' was not exported from C++ code."
+    red3lib::detail::RelocFunc<std::uint8_t*> rtti_registry(red3lib::detail::addresses::CFunction::rtti_registry);
+    red3lib::detail::RelocFunc<void, void*, red3lib::CFunction*> publish(
+        red3lib::detail::addresses::CFunction::publish_global);
+
+    auto* registry = rtti_registry();
+    if (!registry || !readable(registry, 0x68))
+    {
+        out << "    no readable registry, not publishing" << std::endl;
+        return;
+    }
+
+    const auto count_before = *reinterpret_cast<const std::uint32_t*>(registry + 0x44);
+    publish(registry, fn);
+    const auto count_after = *reinterpret_cast<const std::uint32_t*>(registry + 0x44);
+
+    out << "    published: registry holds " << count_before << " -> " << count_after << " functions" << std::endl;
+
+    // Verify the way the COMPILER does: same hash, same buckets, same chain
+    // walk. Finding it here is what "the compiler can see it" means.
+    struct registry_entry
+    {
+        std::uint32_t key;      // 00
+        std::uint32_t unk04;    // 04
+        red3lib::CFunction* fn; // 08
+        std::uint32_t key_again;// 10
+        std::uint32_t unk14;    // 14
+        registry_entry* next;   // 18
+    };
+
+    const auto buckets = *reinterpret_cast<const std::uint32_t*>(registry + 0x40);
+    auto* const* table = *reinterpret_cast<registry_entry* const* const*>(registry + 0x60);
+
+    if (!buckets || !table)
+    {
+        out << "    registry has no buckets to search" << std::endl;
+        return;
+    }
+
+    const red3lib::CFunction* found = nullptr;
+    for (auto* entry = table[name.index() % buckets]; entry; entry = entry->next)
+    {
+        if (entry->key == name.index())
+        {
+            found = entry->fn;
+            break;
+        }
+    }
+
+    out << "    compiler-style lookup by name: " << static_cast<const void*>(found)
+        << (found == fn ? "   <-- FOUND, an import would bind to it" : "   <-- NOT FOUND") << std::endl;
 }
 
 // One round of probes. Repeated as the game progresses: values that are zero at
@@ -1282,6 +1379,10 @@ void run_round(int round)
 
     if (first)
     {
+        // The same measurement once a world exists. A scripted count that rose
+        // from zero means the compiler ran AFTER we loaded, and registration at
+        // load time is early enough to be seen.
+        snapshot_script_state("in world");
         probe_call_in();
     }
 
@@ -1799,6 +1900,10 @@ RED3LIB_C_EXPORT bool RED3LIB_CALL Main(HMODULE aHandle, EMainReason aReason)
     {
         open_log(aHandle);
         out << "RED3lib example loaded" << std::endl;
+
+        // Taken as early as a plugin can run, before anything else here touches
+        // the engine.
+        snapshot_script_state("at plugin load");
         break;
     }
     case EMainReason::Unload:

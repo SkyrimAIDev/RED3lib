@@ -43,6 +43,26 @@ constexpr std::uintptr_t class_method_table = 0x1457d5890 - image_base;
 // Name-anchored. Kept for reference - CFunction::call_native does not need it.
 constexpr std::uintptr_t register_native = 0x141496fa0 - image_base;
 
+// Registering a native is TWO steps, and the second is the one that matters.
+// register_native only initialises the CFunction and writes the implementation
+// into the dispatch table; it publishes nothing. The script compiler resolves
+// `import function` through a separate registry, and a native missing from it
+// fails compilation with "Global native function '%ls' was not exported from
+// C++ code."
+//
+// Read from the engine's own StrLen registration, which does:
+//
+//     call CNamePool::Get / CNamePool::Add      -> name index
+//     call register_native(storage, &name, impl)
+//     call rtti_registry()                      -> the registry
+//     call publish_global(registry, function)   -> now the compiler can see it
+//
+// The registry is a hash map: bucket count at +0x40, entry count at +0x44,
+// buckets at +0x60. An entry is { key, CFunction* value at +0x08, key again at
+// +0x10, next at +0x18 }.
+constexpr std::uintptr_t rtti_registry = 0x140285d60 - image_base;
+constexpr std::uintptr_t publish_global = 0x14146a5f0 - image_base;
+
 // WARNING - STALE. Targets a different 4.00 build and has NOT been re-derived.
 // call_native() replaces it and nothing uses it.
 constexpr std::uintptr_t execute_native = 0x1402FD190 - image_base;
