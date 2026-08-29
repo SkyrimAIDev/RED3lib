@@ -412,6 +412,20 @@ void run_round(int round)
         out << "  GetTimeScale(true) = " << fn->call_native<float>(g_context, true) << std::endl;
     }
 
+    // A String argument. Arguments are placed in the frame's params buffer at
+    // the offset their CProperty declares, and the code stream carries a load
+    // instruction naming that property - so the engine's own type does the
+    // copying and any type works, including ones far too wide for the VM's
+    // immediate opcodes.
+    if (auto* fn = resolve(g_class, L"IsPausedForReason"))
+    {
+        dump_meta("IsPausedForReason", fn);
+        static wchar_t reason[] = L"RED3lib";
+        auto arg = red3lib::borrow_string(reason, static_cast<std::uint32_t>(std::size(reason) - 1));
+        out << "  IsPausedForReason(\"RED3lib\") = " << std::boolalpha << fn->call_native<bool>(g_context, arg)
+            << std::endl;
+    }
+
     if (auto* fn = resolve(g_class, L"IsSpecificRumbleActive"))
     {
         dump_meta("IsSpecificRumbleActive", fn);

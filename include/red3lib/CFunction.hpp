@@ -149,7 +149,6 @@ inline R CFunction::execute_native(IScriptable* context, Args&&... args)
 {
     constexpr auto args_count = sizeof...(Args);
     constexpr auto args_total_size = (0 + ... + sizeof(Args));
-
     auto locals_stack_size = calculate_locals_stack_size();
     auto stack_ptr = reinterpret_cast<std::uint8_t*>(_malloca(locals_stack_size));
     RED3LIB_ASSERT(stack_ptr);
@@ -215,8 +214,6 @@ inline R CFunction::call_native(IScriptable* context, Args&&... args)
     RED3LIB_ASSERT(params.size == sizeof...(args));
     RED3LIB_ASSERT(registration_offset >= 0);
 
-    constexpr auto args_total_size = (0 + ... + sizeof(Args));
-
     auto locals_stack_size = calculate_locals_stack_size();
     auto stack_ptr = reinterpret_cast<std::uint8_t*>(_malloca(locals_stack_size));
     RED3LIB_ASSERT(stack_ptr);
@@ -235,18 +232,35 @@ inline R CFunction::call_native(IScriptable* context, Args&&... args)
     std::memset(stack_ptr, 0, locals_stack_size);
     std::unique_ptr<std::uint8_t, decltype(&_freea)> locals_stack(stack_ptr, &_freea);
 
-    std::array<std::uint8_t, args_total_size + 1> params_stack{};
+    // The params buffer is laid out by the function's own properties, so it is
+    // sized from stack_size rather than from the C++ argument sizes.
+    auto params_size = static_cast<std::size_t>(stack_size) + 1;
+    auto params_ptr = reinterpret_cast<std::uint8_t*>(_malloca(params_size));
+    RED3LIB_ASSERT(params_ptr);
+    if (!params_ptr)
+    {
+        if constexpr (std::is_same_v<R, void>)
+        {
+            return;
+        }
+        else
+        {
+            return R{};
+        }
+    }
 
-    // Arguments are inline typed immediates in the code stream, not CProperty
-    // pointers - see CStackFrameCodeWriter. The +1 keeps the array non-empty for
-    // a zero-argument call.
-    constexpr auto code_size = (1 + ... + CStackFrameCodeWriter::encoded_size<Args>());
+    std::memset(params_ptr, 0, params_size);
+    std::unique_ptr<std::uint8_t, decltype(&_freea)> params_stack(params_ptr, &_freea);
+
+    // One load instruction per argument; +1 keeps it non-empty with no arguments.
+    constexpr auto code_size = CStackFrameCodeWriter::bytes_per_argument * sizeof...(Args) + 1;
     std::array<std::uint8_t, code_size> code_stack{};
 
-    CStackFrame frame(this, context, locals_stack.get(), params_stack.data(), code_stack.data());
+    CStackFrame frame(this, context, locals_stack.get(), params_stack.get(), code_stack.data());
     CStackFrameWriter writer(frame);
 
-    (writer.write_argument(std::forward<Args>(args)), ...);
+    std::size_t index = 0;
+    (writer.write_argument(params.entries[index++], std::forward<Args>(args)), ...);
     writer.end_params();
 
     // registration_offset is one global counter shared by both registrars, so it
