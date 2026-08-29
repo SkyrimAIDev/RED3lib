@@ -87,6 +87,24 @@ struct CFunction : IRTTIBaseObject
     template<typename R = void, typename... Args>
     R call_native(IScriptable* context, Args&&... args);
 
+    // The RTTI types of what this function hands back, so a caller can release
+    // engine allocations through IRTTIType::destruct. Null when there is
+    // nothing to release.
+    [[nodiscard]] IRTTIType* return_type() const noexcept
+    {
+        return return_property ? return_property->type : nullptr;
+    }
+
+    [[nodiscard]] IRTTIType* param_type(std::uint32_t index) const noexcept
+    {
+        if (index >= params.size || !params.entries[index])
+        {
+            return nullptr;
+        }
+
+        return params.entries[index]->type;
+    }
+
     [[nodiscard]] bool is_native() const noexcept
     {
         constexpr auto is_native_flag = 1 << 0;

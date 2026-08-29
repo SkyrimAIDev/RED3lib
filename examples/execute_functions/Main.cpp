@@ -552,8 +552,8 @@ void run_round(int round)
     if (auto* fn = first ? resolve(g_class, L"GetApplicationVersion") : nullptr)
     {
         dump_meta("GetApplicationVersion", fn);
-        auto version = fn->call_native<red3lib::String>(g_context);
-        dump_string("GetApplicationVersion() ->", version);
+        red3lib::owned<red3lib::String> version(fn->return_type(), fn->call_native<red3lib::String>(g_context));
+        dump_string("GetApplicationVersion() ->", *version);
     }
 
     // A one-argument call. String arguments are deliberately not probed: they
@@ -626,12 +626,13 @@ void run_round(int round)
         auto narrowed = narrow(name, static_cast<std::uint32_t>(wcslen(name)));
         dump_meta(narrowed.c_str(), fn);
 
-        auto handle = fn->call_native<red3lib::Handle<void>>(g_context);
-        out << "  " << narrowed << "() handle = " << static_cast<const void*>(handle.block)
-            << "  object = " << static_cast<const void*>(handle.get()) << std::endl;
-        if (handle)
+        red3lib::owned<red3lib::Handle<void>> handle(fn->return_type(),
+                                                     fn->call_native<red3lib::Handle<void>>(g_context));
+        out << "  " << narrowed << "() handle = " << static_cast<const void*>(handle->block)
+            << "  object = " << static_cast<const void*>(handle->get()) << std::endl;
+        if (*handle)
         {
-            describe_object("    ", handle.get());
+            describe_object("    ", handle->get());
         }
     }
 
@@ -646,6 +647,7 @@ void run_round(int round)
         auto handle = fn->call_native<red3lib::Handle<void>>(g_context);
         auto* object = handle.get();
         auto* cls = red3lib::class_of(object);
+        auto* block = handle.block;
 
         out << "  journal manager = " << static_cast<const void*>(object)
             << "  its CClass = " << static_cast<const void*>(cls) << std::endl;
@@ -664,6 +666,29 @@ void run_round(int round)
             else
             {
                 out << "    GetRegularQuestCount not found - class_of returned the wrong class" << std::endl;
+            }
+        }
+
+        // Does releasing actually release? The control block keeps a 32-bit
+        // refcount at +0x00, so this is readable rather than inferred.
+        //
+        // Only checked when the count is above 1 to begin with: at 1, destruct
+        // drops it to zero and frees the block, and reading it afterwards would
+        // be a use-after-free.
+        if (block)
+        {
+            const auto before = block->references;
+            auto* type = fn->return_type();
+
+            if (type && before > 1)
+            {
+                type->destruct(&handle);
+                out << "    handle refcount " << before << " -> " << block->references << " after destruct"
+                    << (block->references == before - 1 ? "  (released)" : "  (NOT RELEASED)") << std::endl;
+            }
+            else
+            {
+                out << "    handle refcount = " << before << ", not releasing (would free the block)" << std::endl;
             }
         }
     }
@@ -790,16 +815,17 @@ void run_round(int round)
                 }
 
                 auto narrowed = narrow(name, static_cast<std::uint32_t>(wcslen(name)));
-                auto text = method->call_native<red3lib::String>(self);
+                red3lib::owned<red3lib::String> text(method->return_type(),
+                                                    method->call_native<red3lib::String>(self));
 
-                if (!text.data)
+                if (!text->data)
                 {
                     out << "    " << narrowed << "() = <null string>" << std::endl;
                     continue;
                 }
 
                 // size counts the terminator, so trim it for display.
-                out << "    " << narrowed << "() = \"" << narrow(text.data, text.size ? text.size - 1 : 0) << '"'
+                out << "    " << narrowed << "() = \"" << narrow(text->data, text->size ? text->size - 1 : 0) << '"'
                     << std::endl;
             }
 
@@ -831,11 +857,10 @@ void run_round(int round)
             // reference on every handle in it belong to the engine and nothing
             // here releases either, so this runs ONCE rather than every round:
             // holding references would keep despawned NPCs alive.
-            static bool enumerated = false;
-            if (!enumerated)
+            // This now runs EVERY round, which is the test. If the release
+            // works, the engine's allocator hands back the same storage each
+            // time; if it leaks, the pointer walks upward round after round.
             {
-                enumerated = true;
-
                 if (auto* fn = resolve(g_class, L"GetAllNPCs"))
                 {
                     red3lib::TDynArray<red3lib::Handle<void>> npcs{};
@@ -845,7 +870,7 @@ void run_round(int round)
                         << static_cast<const void*>(npcs.entries) << std::endl;
 
                     std::uint32_t shown = 0;
-                    for (std::uint32_t i = 0; i < npcs.size && shown < 15; i++)
+                    for (std::uint32_t i = 0; describe_now && i < npcs.size && shown < 15; i++)
                     {
                         auto* npc = npcs.entries[i].get();
                         if (!npc || !readable(npc, 512))
@@ -871,10 +896,11 @@ void run_round(int round)
                         {
                             if (method->is_native())
                             {
-                                auto text = method->call_native<red3lib::String>(npc_self);
-                                if (text.data)
+                                red3lib::owned<red3lib::String> text(method->return_type(),
+                                                                    method->call_native<red3lib::String>(npc_self));
+                                if (text->data)
                                 {
-                                    out << "  name=" << narrow(text.data, text.size ? text.size - 1 : 0);
+                                    out << "  name=" << narrow(text->data, text->size ? text->size - 1 : 0);
                                 }
                             }
                         }
@@ -897,9 +923,51 @@ void run_round(int round)
                         out << std::endl;
                     }
 
-                    if (npcs.size > shown)
+                    if (describe_now && npcs.size > shown)
                     {
                         out << "      (" << (npcs.size - shown) << " more not listed)" << std::endl;
+                    }
+
+                    // The direct leak test. If a reference were taken each
+                    // round and never given back, the SAME NPC's refcount would
+                    // climb by exactly one per round. Process memory cannot
+                    // show this - the game's own streaming moves hundreds of
+                    // megabytes between rounds and buries the signal.
+                    //
+                    // The printed count includes the reference this array is
+                    // holding, so what matters is that it stays CONSTANT across
+                    // rounds, not its absolute value.
+                    static void* tracked = nullptr;
+                    if (!tracked && npcs.size > 0)
+                    {
+                        tracked = npcs.entries[0].get();
+                    }
+
+                    for (std::uint32_t i = 0; tracked && i < npcs.size; i++)
+                    {
+                        if (npcs.entries[i].get() == tracked && npcs.entries[i].block)
+                        {
+                            out << "      tracked NPC " << tracked
+                                << " refcount = " << npcs.entries[i].block->references << std::endl;
+                            break;
+                        }
+                    }
+
+                    // The array's storage, and a reference on every handle in
+                    // it, are the engine's. Handing the array back to its own
+                    // type destructs each element - releasing all 38 handle
+                    // references - and then frees the storage.
+                    if (auto* type = fn->param_type(0))
+                    {
+                        const auto* storage = npcs.entries;
+                        type->destruct(&npcs);
+                        out << "      released the array (storage was " << static_cast<const void*>(storage)
+                            << ", now entries " << static_cast<const void*>(npcs.entries) << " size " << npcs.size
+                            << ")" << std::endl;
+                    }
+                    else
+                    {
+                        out << "      LEAKED: no RTTI type for the out parameter" << std::endl;
                     }
                 }
             }

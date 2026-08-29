@@ -23,8 +23,12 @@ struct [[nodiscard]] Handle
 {
     struct control_block
     {
-        std::uint64_t references; // 00
-        T* instance;              // 08
+        // CRTTIHandleType::destruct does `lock xadd dword ptr [rcx], -1` on the
+        // first field and then reads flags at +4 - so this is a 32-bit refcount
+        // beside a 32-bit flags word, not one 64-bit count.
+        std::int32_t references; // 00
+        std::uint32_t flags;     // 04
+        T* instance;             // 08
     };
 
     control_block* block;
