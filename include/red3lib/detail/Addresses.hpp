@@ -29,6 +29,17 @@ namespace CFunction
 // The table is filled in at runtime; it reads as zeroes in the on-disk image.
 constexpr std::uintptr_t native_table = 0x1457ed890 - image_base;
 
+// Name-anchored. Class methods live in a SEPARATE table from global natives,
+// with 24-byte pointer-to-member entries rather than 8-byte plain pointers.
+// Both registrars share one counter, so each table is sparse and holds only
+// entries of its own kind; `flags & 2` says which kind a CFunction is.
+//
+// Verified against the running game: 2245 populated entries, every one a .text
+// pointer, matching the RTTI dump's native function count exactly. Two entries
+// were checked against implementations read statically from their registration
+// sites and matched.
+constexpr std::uintptr_t class_method_table = 0x1457d5890 - image_base;
+
 // Name-anchored. Kept for reference - CFunction::call_native does not need it.
 constexpr std::uintptr_t register_native = 0x141496fa0 - image_base;
 

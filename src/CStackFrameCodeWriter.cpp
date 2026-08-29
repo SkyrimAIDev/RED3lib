@@ -4,12 +4,3 @@ red3lib::CStackFrameCodeWriter::CStackFrameCodeWriter(std::uint8_t* ptr) noexcep
     : m_cursor(ptr)
 {
 }
-
-void red3lib::CStackFrameCodeWriter::write(CProperty* property)
-{
-    *m_cursor = 0x16;
-    m_cursor++;
-
-    *reinterpret_cast<CProperty**>(m_cursor) = property;
-    m_cursor += sizeof(CProperty*);
-}

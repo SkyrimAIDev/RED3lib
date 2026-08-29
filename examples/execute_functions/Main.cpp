@@ -316,12 +316,23 @@ red3lib::CFunction* resolve(red3lib::CClass* cls, const wchar_t* name)
 // and no amount of stack-frame fiddling will help.
 void dump_meta(const char* label, red3lib::CFunction* fn)
 {
-    red3lib::detail::RelocArray<red3lib::CFunction::native_fn_t> table(
-        red3lib::detail::addresses::CFunction::native_table);
-
-    const void* impl = fn->registration_offset >= 0
-                           ? reinterpret_cast<const void*>(table[static_cast<std::size_t>(fn->registration_offset)])
-                           : nullptr;
+    const void* impl = nullptr;
+    if (fn->registration_offset >= 0)
+    {
+        const auto index = static_cast<std::size_t>(fn->registration_offset);
+        if (fn->is_global())
+        {
+            red3lib::detail::RelocArray<red3lib::CFunction::native_fn_t> table(
+                red3lib::detail::addresses::CFunction::native_table);
+            impl = reinterpret_cast<const void*>(table[index]);
+        }
+        else
+        {
+            red3lib::detail::RelocArray<red3lib::CFunction::native_method_entry> table(
+                red3lib::detail::addresses::CFunction::class_method_table);
+            impl = reinterpret_cast<const void*>(table[index].code);
+        }
+    }
 
     out << "    [" << label << "] flags=0x" << std::hex << fn->flags << std::dec << " params=" << fn->params.size
         << " locals=" << fn->locals.size << " stackSize=" << fn->stack_size << " regOffset=" << fn->registration_offset
@@ -390,13 +401,15 @@ void run_round(int round)
         dump_string("GetApplicationVersion() ->", version);
     }
 
-    if (auto* fn = resolve(g_class, L"IsPausedForReason"))
+    // A one-argument call. String arguments are deliberately not probed: they
+    // are 12 bytes and the VM has no immediate opcode for that width, so
+    // CStackFrameCodeWriter rejects them at compile time rather than letting the
+    // call corrupt the code stream. GetTimeScale takes a bool, which encodes as
+    // a 1-byte immediate.
+    if (auto* fn = resolve(g_class, L"GetTimeScale"))
     {
-        dump_meta("IsPausedForReason", fn);
-        static wchar_t reason[] = L"RED3lib";
-        auto arg = red3lib::borrow_string(reason, static_cast<std::uint32_t>(std::size(reason) - 1));
-        out << "  IsPausedForReason(\"RED3lib\") = " << std::boolalpha << fn->call_native<bool>(g_context, arg)
-            << std::endl;
+        dump_meta("GetTimeScale", fn);
+        out << "  GetTimeScale(true) = " << fn->call_native<float>(g_context, true) << std::endl;
     }
 
     if (auto* fn = resolve(g_class, L"IsSpecificRumbleActive"))

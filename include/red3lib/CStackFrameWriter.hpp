@@ -18,7 +18,7 @@ public:
     RED3LIB_NON_COPYABLE_AND_NON_MOVABLE(CStackFrameWriter);
 
     template<typename T>
-    void write_value(CProperty* property, T value);
+    void write_argument(T value);
     void end_params();
 
 private:
@@ -27,9 +27,8 @@ private:
 };
 
 template<typename T>
-inline void CStackFrameWriter::write_value(CProperty* property, T value)
+inline void CStackFrameWriter::write_argument(T value)
 {
-    m_params.write(value);
-    m_code.write(property);
+    m_code.write(value);
 }
 } // namespace red3lib

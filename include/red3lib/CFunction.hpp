@@ -48,6 +48,28 @@ struct CFunction : IRTTIBaseObject
     // context) and r8 is where the return value is written.
     using native_fn_t = void (*)(IScriptable* context, CStackFrame* frame, void* result);
 
+    // A class-method entry: MSVC's most general pointer-to-member form. Surveyed
+    // across all 2245 live entries - `code` is always a .text pointer,
+    // `this_adjust` is 0 except for fifteen methods reached through a secondary
+    // base where it is 16, and the trailing field is uninitialised stack the
+    // registrar never fills in.
+    struct native_method_entry
+    {
+        native_fn_t code;           // 00
+        std::int32_t this_adjust;   // 08 - byte offset applied to the context
+        std::int32_t unused0;       // 0C
+        std::int32_t unused1;       // 10
+        std::int32_t uninitialised; // 14 - never read
+    };
+    static_assert(sizeof(native_method_entry) == 24, "class-method table has a 24-byte stride");
+
+    // Globals are registered into a different table with plain 8-byte entries.
+    [[nodiscard]] bool is_global() const noexcept
+    {
+        constexpr auto is_global_flag = 1 << 1;
+        return (flags & is_global_flag) == is_global_flag;
+    }
+
     template<typename R = void, typename... Args>
     R execute(IScriptable* context, Args&&... args);
 
@@ -193,7 +215,6 @@ inline R CFunction::call_native(IScriptable* context, Args&&... args)
     RED3LIB_ASSERT(params.size == sizeof...(args));
     RED3LIB_ASSERT(registration_offset >= 0);
 
-    constexpr auto args_count = sizeof...(Args);
     constexpr auto args_total_size = (0 + ... + sizeof(Args));
 
     auto locals_stack_size = calculate_locals_stack_size();
@@ -216,29 +237,44 @@ inline R CFunction::call_native(IScriptable* context, Args&&... args)
 
     std::array<std::uint8_t, args_total_size + 1> params_stack{};
 
-    // The writer emits 9 bytes per parameter (a 0x16 opcode plus a CProperty*).
-    // The engine's fetch loop reads the opcode, dispatches, then advances the
-    // code pointer once more - whether that trailing byte is per-parameter or a
-    // single end marker is not yet established, so size for the worst case. Over
-    // -allocating here only wastes stack; under-allocating corrupts it.
-    std::array<std::uint8_t, 10 * args_count + 1> code_stack{};
+    // Arguments are inline typed immediates in the code stream, not CProperty
+    // pointers - see CStackFrameCodeWriter. The +1 keeps the array non-empty for
+    // a zero-argument call.
+    constexpr auto code_size = (1 + ... + CStackFrameCodeWriter::encoded_size<Args>());
+    std::array<std::uint8_t, code_size> code_stack{};
 
     CStackFrame frame(this, context, locals_stack.get(), params_stack.data(), code_stack.data());
     CStackFrameWriter writer(frame);
 
-    std::size_t index = 0;
-    (writer.write_value(params.entries[index++], std::forward<Args>(args)), ...);
+    (writer.write_argument(std::forward<Args>(args)), ...);
     writer.end_params();
 
-    detail::RelocArray<native_fn_t> table(detail::addresses::CFunction::native_table);
-    auto impl = table[static_cast<std::size_t>(registration_offset)];
+    // registration_offset is one global counter shared by both registrars, so it
+    // indexes whichever table this function was registered into; the other is
+    // simply empty at that index.
+    auto* self = context;
+    native_fn_t impl = nullptr;
+
+    if (is_global())
+    {
+        detail::RelocArray<native_fn_t> table(detail::addresses::CFunction::native_table);
+        impl = table[static_cast<std::size_t>(registration_offset)];
+    }
+    else
+    {
+        detail::RelocArray<native_method_entry> table(detail::addresses::CFunction::class_method_table);
+        const auto& entry = table[static_cast<std::size_t>(registration_offset)];
+        impl = entry.code;
+        self = reinterpret_cast<IScriptable*>(reinterpret_cast<std::uint8_t*>(context) + entry.this_adjust);
+    }
+
     RED3LIB_ASSERT(impl);
 
     if constexpr (std::is_same_v<R, void>)
     {
         if (impl)
         {
-            impl(context, &frame, nullptr);
+            impl(self, &frame, nullptr);
         }
     }
     else
@@ -246,7 +282,7 @@ inline R CFunction::call_native(IScriptable* context, Args&&... args)
         R result{};
         if (impl)
         {
-            impl(context, &frame, &result);
+            impl(self, &frame, &result);
         }
 
         return result;
