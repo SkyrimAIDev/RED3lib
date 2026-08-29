@@ -412,18 +412,35 @@ void run_round(int round)
         out << "  GetTimeScale(true) = " << fn->call_native<float>(g_context, true) << std::endl;
     }
 
-    // A String argument. Arguments are placed in the frame's params buffer at
-    // the offset their CProperty declares, and the code stream carries a load
-    // instruction naming that property - so the engine's own type does the
-    // copying and any type works, including ones far too wide for the VM's
-    // immediate opcodes.
-    if (auto* fn = resolve(g_class, L"IsPausedForReason"))
+    // A String argument, tested so the result actually discriminates.
+    //
+    // IsPausedForReason returning false proves nothing: it is false whether or
+    // not the argument arrived, which is exactly what the broken encoding also
+    // produced. Pause keys on the string, so setting the state and reading it
+    // back can only agree if the content survived both calls. Unpause restores
+    // it either way.
+    if (auto* is_paused = resolve(g_class, L"IsPausedForReason"))
     {
-        dump_meta("IsPausedForReason", fn);
+        dump_meta("IsPausedForReason", is_paused);
+
         static wchar_t reason[] = L"RED3lib";
         auto arg = red3lib::borrow_string(reason, static_cast<std::uint32_t>(std::size(reason) - 1));
-        out << "  IsPausedForReason(\"RED3lib\") = " << std::boolalpha << fn->call_native<bool>(g_context, arg)
+
+        out << std::boolalpha << "  IsPausedForReason before = " << is_paused->call_native<bool>(g_context, arg)
             << std::endl;
+
+        if (auto* pause = resolve(g_class, L"Pause"))
+        {
+            pause->call_native<void>(g_context, arg);
+            out << "  IsPausedForReason after Pause = " << is_paused->call_native<bool>(g_context, arg)
+                << "   <-- true proves the string content was delivered" << std::endl;
+        }
+
+        if (auto* unpause = resolve(g_class, L"Unpause"))
+        {
+            unpause->call_native<void>(g_context, arg);
+            out << "  IsPausedForReason after Unpause = " << is_paused->call_native<bool>(g_context, arg) << std::endl;
+        }
     }
 
     if (auto* fn = resolve(g_class, L"IsSpecificRumbleActive"))
