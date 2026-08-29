@@ -416,6 +416,16 @@ void dump_meta(const char* label, red3lib::CFunction* fn)
         << " impl=" << impl << std::endl;
 }
 
+// The engine's Vector - four floats, 16 bytes, per the RTTI dump. A native
+// writes its result through the third argument, so only the size has to match.
+struct engine_vector
+{
+    float x;
+    float y;
+    float z;
+    float w;
+};
+
 red3lib::CClass* g_class = nullptr;
 red3lib::IScriptable* g_context = nullptr;
 
@@ -590,6 +600,116 @@ void run_round(int round)
         }
     }
 
+    // The player, and reading state off it.
+    //
+    // CR4Game declares `player` as `handle:CPlayer` at offset 48592, so the
+    // player is a plain field read off the game instance we already have - no
+    // tag to guess and no heap scan. The offset comes from the game's own
+    // -dumprtti, so a patch means regenerating it rather than re-finding it.
+    //
+    // The class chain is what makes this discriminating. A stray pointer can
+    // still yield a plausible-looking class, but it will not reproduce the
+    // exact inheritance AND the per-level sizes that the RTTI dump records
+    // independently. Names are compared as interned CNameHash indices rather
+    // than resolved to text: interning makes equal names equal indices, and
+    // CNamePool::find_wide is still stale for this build.
+    {
+        constexpr std::size_t player_field_offset = 48592;
+
+        static const struct
+        {
+            const wchar_t* name;
+            std::int32_t size;
+        } expected[] = {
+            {L"CR4Player", 2752}, {L"CPlayer", 2496},          {L"CActor", 2368},
+            {L"CGameplayEntity", 512}, {L"CPeristentEntity", 400}, {L"CEntity", 368},
+            {L"CNode", 240},      {L"CObject", 88},            {L"IScriptable", 48},
+            {L"ISerializable", 16}, {L"IReferencable", 16},
+        };
+
+        auto& handle = *reinterpret_cast<red3lib::Handle<void>*>(
+            reinterpret_cast<std::uint8_t*>(g_context) + player_field_offset);
+        auto* player = handle.get();
+
+        out << std::endl
+            << "  CR4Game.player handle = " << static_cast<const void*>(handle.block)
+            << "  object = " << static_cast<const void*>(player) << std::endl;
+
+        if (!player)
+        {
+            out << "    null - no player in the world yet" << std::endl;
+        }
+        else
+        {
+            out << "    class chain:" << std::endl;
+
+            int depth = 0;
+            for (auto* c = red3lib::class_of(player); c && depth < 24; c = c->base, depth++)
+            {
+                out << "      [" << depth << "] size=" << c->size;
+
+                const wchar_t* matched = nullptr;
+                std::int32_t dump_size = 0;
+                for (const auto& entry : expected)
+                {
+                    if (c->name == red3lib::CNameHash(entry.name))
+                    {
+                        matched = entry.name;
+                        dump_size = entry.size;
+                        break;
+                    }
+                }
+
+                if (!matched)
+                {
+                    // Not a failure on its own: the runtime class may be a
+                    // scripted subclass, which the native dump does not list.
+                    out << "  <not one of the expected native classes>";
+                }
+                else
+                {
+                    out << "  " << narrow(matched, static_cast<std::uint32_t>(wcslen(matched)));
+                    out << (c->size == dump_size ? "  size agrees with the dump"
+                                                 : "  SIZE DISAGREES WITH THE DUMP");
+                }
+
+                out << std::endl;
+            }
+
+            auto* cls = red3lib::class_of(player);
+            auto* self = reinterpret_cast<red3lib::IScriptable*>(player);
+
+            for (const wchar_t* name : {L"GetName", L"GetDisplayName", L"GetTagsString"})
+            {
+                auto* method = resolve(cls, name);
+                if (!method)
+                {
+                    continue;
+                }
+
+                auto narrowed = narrow(name, static_cast<std::uint32_t>(wcslen(name)));
+                auto text = method->call_native<red3lib::String>(self);
+
+                if (!text.data)
+                {
+                    out << "    " << narrowed << "() = <null string>" << std::endl;
+                    continue;
+                }
+
+                // size counts the terminator, so trim it for display.
+                out << "    " << narrowed << "() = \"" << narrow(text.data, text.size ? text.size - 1 : 0) << '"'
+                    << std::endl;
+            }
+
+            if (auto* method = resolve(cls, L"GetWorldPosition"))
+            {
+                auto position = method->call_native<engine_vector>(self);
+                out << "    GetWorldPosition() = " << position.x << ", " << position.y << ", " << position.z
+                    << std::endl;
+            }
+        }
+    }
+
     if (auto* fn = resolve(g_class, L"GetEngineTimeAsSeconds"))
     {
         out << "  GetEngineTimeAsSeconds() = " << fn->call_native<float>(g_context) << "  (post-check)" << std::endl;
@@ -626,7 +746,7 @@ RED3LIB_C_EXPORT void RED3LIB_CALL Update()
     // native legitimately had nothing to return. Rounds spanning menu, load and
     // in-world distinguish "too early" from "marshalling is wrong".
     constexpr int frames_between_rounds = 300;
-    constexpr int max_rounds = 4;
+    constexpr int max_rounds = 60;
     constexpr int max_scans = 40;
 
     static int frame = 0;
