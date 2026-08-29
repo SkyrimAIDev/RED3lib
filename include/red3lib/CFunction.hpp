@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <malloc.h>
 #include <memory>
 #include <type_traits>
 
@@ -40,8 +42,33 @@ struct CFunction : IRTTIBaseObject
         std::int32_t unk4C;
     };
 
+    // Signature every native implementation is called with. Confirmed across
+    // StrLen, StrUpper, StrCmp, IntToString and StringToInt: rdx is the stack
+    // frame (each reads frame+0x30 for the code pointer and frame+0x00 for the
+    // context) and r8 is where the return value is written.
+    using native_fn_t = void (*)(IScriptable* context, CStackFrame* frame, void* result);
+
     template<typename R = void, typename... Args>
     R execute(IScriptable* context, Args&&... args);
+
+    // Invoke a native directly through the engine's dispatch table, bypassing
+    // CFunction::execute_native.
+    //
+    // RegisterNative does not store the implementation in the CFunction - it
+    // appends it to a global table and records only the index here, in
+    // registration_offset. That table is reachable by name (see
+    // tools/w3offsets), whereas execute_native is not, so this path survives
+    // game patches and execute() currently does not.
+    //
+    // Only valid for native functions; check the native flag first.
+    template<typename R = void, typename... Args>
+    R call_native(IScriptable* context, Args&&... args);
+
+    [[nodiscard]] bool is_native() const noexcept
+    {
+        constexpr auto is_native_flag = 1 << 0;
+        return (flags & is_native_flag) == is_native_flag;
+    }
 
     CClass* owner;                    // 08
     red3lib::CNameHash name;          // 10
@@ -154,6 +181,73 @@ inline R CFunction::execute_scripted(IScriptable* context, Args&&... args)
     {
         R result{};
         func(this, context, params_stack.data(), &result);
+
+        return result;
+    }
+}
+
+template<typename R, typename... Args>
+inline R CFunction::call_native(IScriptable* context, Args&&... args)
+{
+    RED3LIB_ASSERT(is_native());
+    RED3LIB_ASSERT(params.size == sizeof...(args));
+    RED3LIB_ASSERT(registration_offset >= 0);
+
+    constexpr auto args_count = sizeof...(Args);
+    constexpr auto args_total_size = (0 + ... + sizeof(Args));
+
+    auto locals_stack_size = calculate_locals_stack_size();
+    auto stack_ptr = reinterpret_cast<std::uint8_t*>(_malloca(locals_stack_size));
+    RED3LIB_ASSERT(stack_ptr);
+    if (!stack_ptr)
+    {
+        if constexpr (std::is_same_v<R, void>)
+        {
+            return;
+        }
+        else
+        {
+            return R{};
+        }
+    }
+
+    std::memset(stack_ptr, 0, locals_stack_size);
+    std::unique_ptr<std::uint8_t, decltype(&_freea)> locals_stack(stack_ptr, &_freea);
+
+    std::array<std::uint8_t, args_total_size + 1> params_stack{};
+
+    // The writer emits 9 bytes per parameter (a 0x16 opcode plus a CProperty*).
+    // The engine's fetch loop reads the opcode, dispatches, then advances the
+    // code pointer once more - whether that trailing byte is per-parameter or a
+    // single end marker is not yet established, so size for the worst case. Over
+    // -allocating here only wastes stack; under-allocating corrupts it.
+    std::array<std::uint8_t, 10 * args_count + 1> code_stack{};
+
+    CStackFrame frame(this, context, locals_stack.get(), params_stack.data(), code_stack.data());
+    CStackFrameWriter writer(frame);
+
+    std::size_t index = 0;
+    (writer.write_value(params.entries[index++], std::forward<Args>(args)), ...);
+    writer.end_params();
+
+    detail::RelocArray<native_fn_t> table(detail::addresses::CFunction::native_table);
+    auto impl = table[static_cast<std::size_t>(registration_offset)];
+    RED3LIB_ASSERT(impl);
+
+    if constexpr (std::is_same_v<R, void>)
+    {
+        if (impl)
+        {
+            impl(context, &frame, nullptr);
+        }
+    }
+    else
+    {
+        R result{};
+        if (impl)
+        {
+            impl(context, &frame, &result);
+        }
 
         return result;
     }

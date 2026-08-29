@@ -1,6 +1,7 @@
 #pragma once
 
 #include <red3lib/CNameHash.hpp>
+#include <red3lib/String.hpp>
 #include <red3lib/CNamePool.hpp>
 
 #include <red3lib/CClass.hpp>

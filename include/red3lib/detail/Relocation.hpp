@@ -46,6 +46,21 @@ private:
     T** m_address;
 };
 
+// An array that lives at a fixed offset in the image. Unlike RelocPtr, the
+// offset *is* the array, it does not hold a pointer to one.
+template<typename T>
+class [[nodiscard]] RelocArray : private BaseReloc
+{
+public:
+    RelocArray(std::uintptr_t offset);
+
+    [[nodiscard]] T* data() const noexcept;
+    [[nodiscard]] T& operator[](std::size_t index) const noexcept;
+
+private:
+    T* m_address;
+};
+
 template<typename F, typename... Args>
     requires std::invocable<F(Args...), Args...>
 inline RelocFunc<F, Args...>::RelocFunc(std::uintptr_t offset)
@@ -81,6 +96,24 @@ template<typename T>
 inline T* RelocPtr<T>::operator->() const noexcept
 {
     return *m_address;
+}
+
+template<typename T>
+inline RelocArray<T>::RelocArray(std::uintptr_t offset)
+    : m_address(reinterpret_cast<T*>(offset + image_base()))
+{
+}
+
+template<typename T>
+inline T* RelocArray<T>::data() const noexcept
+{
+    return m_address;
+}
+
+template<typename T>
+inline T& RelocArray<T>::operator[](std::size_t index) const noexcept
+{
+    return m_address[index];
 }
 } // namespace red3lib::detail
 
