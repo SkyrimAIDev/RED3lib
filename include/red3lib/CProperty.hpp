@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include <red3lib/CNameHash.hpp>
 #include <red3lib/IRTTIBaseObject.hpp>
 #include <red3lib/detail/Asserts.hpp>
 
@@ -27,7 +28,11 @@ struct IRTTIType;
 struct CProperty : IRTTIBaseObject
 {
     IRTTIType* type;      // 08
-    std::uint64_t unk10;  // 10
+    // Read out of the engine: resolving the dword at +0x10 as a name index
+    // yields CR4Game's real property names - horseCamera, telemetryScriptProxy,
+    // secondScreenScriptProxy - which the RTTI dump lists independently.
+    CNameHash name;       // 10
+    std::uint32_t unk14;  // 14
     std::uint64_t unk18;  // 18
     std::uint32_t offset; // 20 - byte offset of the value from its base
     std::uint32_t flags;  // 24

@@ -557,6 +557,166 @@ bool locate()
     return true;
 }
 
+// Put words on screen, with the given entity as the speaker.
+//
+// ShowOneliner is the floating line above an actor's head - what the game uses
+// for its own barks. The first attempt made the PLAYER the speaker and nothing
+// appeared; OnCreateOneliner takes the entity as the one talking, so the player
+// is probably not a case the HUD renders. An NPC is the game's own usage.
+//
+// The richer channels - OnDialogSentenceSet, OnSubtitleAdded - are scripted, so
+// call_native refuses them while execute_scripted is stale. Going through the
+// native entry lets the engine dispatch into them.
+void speak_oneliner(red3lib::Handle<void>& speaker, const std::string& who, float distance)
+{
+    auto* fn = resolve(g_class, L"GetHud");
+    if (!fn)
+    {
+        return;
+    }
+
+    red3lib::owned<red3lib::Handle<void>> hud(fn->return_type(),
+                                             fn->call_native<red3lib::Handle<void>>(g_context));
+    auto* hud_class = hud->get() ? red3lib::class_of(hud->get()) : nullptr;
+    if (!hud_class)
+    {
+        out << "    no HUD to speak through" << std::endl;
+        return;
+    }
+
+    auto* method = hud_class->find_function(L"ShowOneliner");
+    const bool callable = method && method->is_native() && method->params.size == 2 && method->param_type(0) &&
+                          method->param_type(1) && method->param_type(0)->size() == sizeof(red3lib::String) &&
+                          method->param_type(1)->size() == sizeof(red3lib::Handle<void>);
+
+    if (!callable)
+    {
+        out << "    ShowOneliner is not callable with what we have" << std::endl;
+        return;
+    }
+
+    static wchar_t line[] = L"RED3lib speaking.";
+    method->call_native<void>(reinterpret_cast<red3lib::IScriptable*>(hud->get()), red3lib::borrow_string(line),
+                              speaker);
+
+    out << "    ShowOneliner -> " << who << " at " << distance << "m" << std::endl;
+}
+
+// Where does a CProperty keep its name?
+//
+// The layout has type@0x08, offset@0x20 and flags@0x24, with 0x10 and 0x18
+// unidentified. Rather than guess, resolve each candidate dword as a name index
+// and see which one produces the property names we already know from the dump -
+// CR4Game has `player` and `activeWorld`.
+void find_property_name_offset(red3lib::CClass* cls)
+{
+    out << "  CProperty name offset probe (expecting player / activeWorld):" << std::endl;
+
+    for (std::uint32_t i = 0; i < cls->properties.size && i < 4; i++)
+    {
+        auto* property = cls->properties.entries[i];
+        if (!property || !readable(property, 0x30))
+        {
+            continue;
+        }
+
+        out << "    property " << i << " offset=" << property->offset << ":";
+
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(property);
+        for (std::uint32_t at : {0x10u, 0x14u, 0x18u, 0x1Cu})
+        {
+            red3lib::CNameHash candidate{};
+            std::memcpy(&candidate, raw + at, sizeof(candidate));
+            auto text = candidate.to_wide();
+
+            out << "  +0x" << std::hex << at << std::dec << "=";
+            if (text.empty())
+            {
+                out << "<none>";
+            }
+            else
+            {
+                out << narrow(text.data(), static_cast<std::uint32_t>(text.size()));
+            }
+        }
+
+        out << std::endl;
+    }
+}
+
+// The control that has been missing: is a HANDLE argument delivered?
+//
+// String arguments are proven by Pause / IsPausedForReason. Handles are not, and
+// ShowOneliner tolerates a null entity - it dispatches anyway - so an argument
+// that never arrives is indistinguishable from a call that did nothing.
+//
+// Rather than pick a function by name, scan for one with the right SHAPE: one
+// handle parameter, a non-void return, and a Get/Is/Has name so it only reads.
+// A result that varies with the handle can only come from the handle arriving.
+void probe_handle_argument(red3lib::CClass* cls, red3lib::IScriptable* context, red3lib::Handle<void>& subject,
+                           red3lib::Handle<void>& other)
+{
+    for (auto* c = cls; c; c = c->base)
+    {
+        for (std::uint32_t i = 0; i < c->functions.size; i++)
+        {
+            auto* fn = c->functions.entries[i];
+            if (!fn || !fn->is_native() || fn->params.size != 1 || !fn->return_property)
+            {
+                continue;
+            }
+
+            auto* param = fn->param_type(0);
+            auto* returns = fn->return_property->type;
+            if (!param || !returns || param->size() != sizeof(red3lib::Handle<void>))
+            {
+                continue;
+            }
+
+            const auto* param_name = param->name();
+            if (!param_name)
+            {
+                continue;
+            }
+
+            auto param_text = param_name->to_wide();
+            if (param_text.rfind(L"handle:", 0) != 0)
+            {
+                continue;
+            }
+
+            auto fn_text = fn->name.to_wide();
+            if (fn_text.rfind(L"Get", 0) != 0 && fn_text.rfind(L"Is", 0) != 0 && fn_text.rfind(L"Has", 0) != 0)
+            {
+                continue;
+            }
+
+            // Only types small enough to read back as a plain value.
+            if (returns->size() > sizeof(std::uint64_t))
+            {
+                continue;
+            }
+
+            auto narrowed = narrow(fn_text.data(), static_cast<std::uint32_t>(fn_text.size()));
+            dump_signature("    ", narrowed.c_str(), fn);
+
+            red3lib::Handle<void> nothing{};
+            const auto with_subject = fn->call_native<std::uint64_t>(context, subject);
+            const auto with_null = fn->call_native<std::uint64_t>(context, nothing);
+            const auto with_other = fn->call_native<std::uint64_t>(context, other);
+
+            out << "      subject=" << with_subject << "  null=" << with_null << "  other=" << with_other;
+            out << ((with_subject != with_null || with_other != with_null)
+                        ? "   <-- the handle IS delivered"
+                        : "   (identical - proves nothing)")
+                << std::endl;
+            return;
+        }
+    }
+
+    out << "    no single-handle read-only native found to test with" << std::endl;
+}
+
 // One round of probes. Repeated as the game progresses: values that are zero at
 // the menu but populated in-world tell us the earlier run was simply too early,
 // rather than the marshalling being wrong.
@@ -740,6 +900,26 @@ void run_round(int round)
         }
     }
 
+    // Is a HANDLE argument delivered at all?
+    //
+    // String arguments are proven, by Pause / IsPausedForReason. A handle
+    // argument has never been checked, and ShowOneliner tolerates a null entity
+    // - it dispatches anyway - so a handle that never arrives looks exactly
+    // like a call that did nothing. This is the missing control.
+    if (first)
+    {
+        find_property_name_offset(g_class);
+
+        for (const wchar_t* name : {L"RequestPopup", L"ClosePopup", L"EnableSubtitles", L"AreSubtitlesEnabled"})
+        {
+            if (auto* fn = resolve(g_class, name))
+            {
+                auto narrowed = narrow(name, static_cast<std::uint32_t>(wcslen(name)));
+                dump_signature("    ", narrowed.c_str(), fn);
+            }
+        }
+    }
+
     // Text output: what can actually put words on screen.
     //
     // GetHud returns null at the main menu, which is why earlier rounds saw
@@ -770,46 +950,8 @@ void run_round(int round)
             }
         }
 
-        // Put words on screen.
-        //
-        // ShowOneliner is the floating line above an actor's head - the channel
-        // the game uses for its own barks, which is what an LLM layer would
-        // speak through. Both argument types are already proven: a String, as
-        // Pause takes, and an 8-byte handle.
-        //
-        // The scripted handlers on CR4ScriptedHud - OnCreateOneliner,
-        // OnDialogSentenceSet, OnSubtitleAdded - are richer, but they are
-        // SCRIPTED, and execute_scripted is still stale. Going through the
-        // native entry point lets the engine dispatch to them for us.
-        static bool spoke = false;
-        if (hud_class && !spoke)
-        {
-            auto* method = hud_class->find_function(L"ShowOneliner");
-            auto& player_handle = *reinterpret_cast<red3lib::Handle<void>*>(
-                reinterpret_cast<std::uint8_t*>(g_context) + 48592);
-
-            // Only call once the signature is confirmed to be what we can
-            // supply, rather than trusting the name.
-            const bool callable = method && method->is_native() && method->params.size == 2 &&
-                                  method->param_type(0) && method->param_type(1) &&
-                                  method->param_type(0)->size() == sizeof(red3lib::String) &&
-                                  method->param_type(1)->size() == sizeof(red3lib::Handle<void>);
-
-            if (callable && player_handle.get())
-            {
-                spoke = true;
-
-                static wchar_t line[] = L"RED3lib is speaking through the HUD.";
-                method->call_native<void>(reinterpret_cast<red3lib::IScriptable*>(hud->get()),
-                                          red3lib::borrow_string(line), player_handle);
-
-                out << "  ShowOneliner called on the player - look above Geralt's head" << std::endl;
-            }
-            else if (method && !callable)
-            {
-                out << "  ShowOneliner signature is not what we can supply; not calling" << std::endl;
-            }
-        }
+        // The call itself happens in the enumeration below, where an NPC handle
+        // is available. Targeting the player produced no visible text.
     }
 
     // The player, and reading state off it.
@@ -1036,6 +1178,87 @@ void run_round(int round)
                     // The printed count includes the reference this array is
                     // holding, so what matters is that it stays CONSTANT across
                     // rounds, not its absolute value.
+                    // The nearest NPC, which is also the one most likely to
+                    // be on screen where a oneliner can be seen.
+                    if (have_player_position)
+                    {
+                        red3lib::Handle<void>* nearest = nullptr;
+                        float nearest_distance = 0.0f;
+
+                        for (std::uint32_t i = 0; i < npcs.size; i++)
+                        {
+                            auto* npc = npcs.entries[i].get();
+                            if (!npc || !readable(npc, 512))
+                            {
+                                continue;
+                            }
+
+                            auto* npc_class = red3lib::class_of(npc);
+                            if (!npc_class)
+                            {
+                                continue;
+                            }
+
+                            auto* pos = npc_class->find_function(L"GetWorldPosition");
+                            if (!pos || !pos->is_native())
+                            {
+                                continue;
+                            }
+
+                            auto at = pos->call_native<engine_vector>(reinterpret_cast<red3lib::IScriptable*>(npc));
+                            const auto dx = at.x - player_position.x;
+                            const auto dy = at.y - player_position.y;
+                            const auto dz = at.z - player_position.z;
+                            const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                            if (!nearest || distance < nearest_distance)
+                            {
+                                nearest = &npcs.entries[i];
+                                nearest_distance = distance;
+                            }
+                        }
+
+                        if (nearest)
+                        {
+                            std::string who = "<unnamed>";
+                            auto* npc_class = red3lib::class_of(nearest->get());
+                            if (auto* name_fn = npc_class ? npc_class->find_function(L"GetDisplayName") : nullptr)
+                            {
+                                if (name_fn->is_native())
+                                {
+                                    red3lib::owned<red3lib::String> text(
+                                        name_fn->return_type(),
+                                        name_fn->call_native<red3lib::String>(
+                                            reinterpret_cast<red3lib::IScriptable*>(nearest->get())));
+                                    if (text->data)
+                                    {
+                                        who = narrow(text->data, text->size ? text->size - 1 : 0);
+                                    }
+                                }
+                            }
+
+                            static bool handle_probe_done = false;
+                            if (!handle_probe_done)
+                            {
+                                handle_probe_done = true;
+
+                                auto& player_handle = *reinterpret_cast<red3lib::Handle<void>*>(
+                                    reinterpret_cast<std::uint8_t*>(g_context) + 48592);
+
+                                out << "  handle-argument control:" << std::endl;
+
+                                // Actors are where handle-taking natives live -
+                                // the game class has none, which is why the
+                                // first scan came up empty. Context is the NPC,
+                                // and the handle argument is the player.
+                                auto* npc_context = reinterpret_cast<red3lib::IScriptable*>(nearest->get());
+                                probe_handle_argument(npc_class, npc_context, player_handle, *nearest);
+                            }
+
+                            speak_oneliner(*nearest, who, nearest_distance);
+                        }
+                    }
+
                     // Pinning one NPC does not survive: the first attempt
                     // tracked entries[0] and went quiet after two samples
                     // because that NPC streamed out as the player moved. So
