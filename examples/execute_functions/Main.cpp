@@ -319,21 +319,35 @@ void describe_object(const char* indent, void* object)
         return;
     }
 
-    auto* base = reinterpret_cast<std::uint8_t*>(GetModuleHandle(nullptr));
-    auto* vptr = *reinterpret_cast<std::uint8_t**>(object);
-
-    const char* name = "<not a known class>";
-    for (const auto& kc : known_classes)
+    auto* cls = red3lib::class_of(object);
+    if (!cls || !readable(cls, sizeof(red3lib::CClass)))
     {
-        if (vptr == base + kc.vtable_offset)
+        out << indent << "no readable CClass at +0x18" << std::endl;
+        return;
+    }
+
+    auto class_name = cls->name.to_wide();
+    out << indent << "class = " << narrow(class_name.data(), static_cast<std::uint32_t>(class_name.size()))
+        << "  size = " << cls->size << std::endl;
+
+    // The GUID and tag list are at CEntity's offsets, so they only mean
+    // anything if this object really is an entity. They used to be read off
+    // every object, which is why a journal manager reported a tag count.
+    bool is_entity = false;
+    for (auto* c = cls; c; c = c->base)
+    {
+        if (c->name == red3lib::CNameHash(L"CEntity"))
         {
-            name = kc.name;
+            is_entity = true;
             break;
         }
     }
 
-    out << indent << "vptr = " << static_cast<void*>(vptr) << "  (image+0x" << std::hex
-        << static_cast<std::size_t>(vptr - base) << std::dec << ")  class = " << name << std::endl;
+    if (!is_entity)
+    {
+        out << indent << "not a CEntity, so no GUID or tags to read" << std::endl;
+        return;
+    }
 
     auto* bytes = reinterpret_cast<std::uint8_t*>(object);
     bool guid_set = false;
@@ -611,8 +625,9 @@ void run_round(int round)
     // still yield a plausible-looking class, but it will not reproduce the
     // exact inheritance AND the per-level sizes that the RTTI dump records
     // independently. Names are compared as interned CNameHash indices rather
-    // than resolved to text: interning makes equal names equal indices, and
-    // CNamePool::find_wide is still stale for this build.
+    // than resolved to text as well as printed: interning makes equal names
+    // equal indices, so the check does not depend on the pool lookup being
+    // right.
     {
         constexpr std::size_t player_field_offset = 48592;
 
@@ -646,7 +661,12 @@ void run_round(int round)
             int depth = 0;
             for (auto* c = red3lib::class_of(player); c && depth < 24; c = c->base, depth++)
             {
-                out << "      [" << depth << "] size=" << c->size;
+                auto class_name = c->name.to_wide();
+                out << "      [" << depth << "] "
+                    << (class_name.empty()
+                            ? std::string("<unnamed>")
+                            : narrow(class_name.data(), static_cast<std::uint32_t>(class_name.size())))
+                    << "  size=" << c->size;
 
                 const wchar_t* matched = nullptr;
                 std::int32_t dump_size = 0;
@@ -664,11 +684,10 @@ void run_round(int round)
                 {
                     // Not a failure on its own: the runtime class may be a
                     // scripted subclass, which the native dump does not list.
-                    out << "  <not one of the expected native classes>";
+                    out << "  <not a native class - scripted, so absent from the dump>";
                 }
                 else
                 {
-                    out << "  " << narrow(matched, static_cast<std::uint32_t>(wcslen(matched)));
                     out << (c->size == dump_size ? "  size agrees with the dump"
                                                  : "  SIZE DISAGREES WITH THE DUMP");
                 }

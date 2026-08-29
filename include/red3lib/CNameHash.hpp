@@ -36,6 +36,13 @@ public:
 
     [[nodiscard]] std::wstring_view to_wide() const;
 
+    // Its position in the name pool's entry array, which is what the pool
+    // indexes by. Zero is the empty name.
+    [[nodiscard]] constexpr std::uint32_t index() const noexcept
+    {
+        return m_index;
+    }
+
 private:
     std::uint32_t m_index; // 00
 };

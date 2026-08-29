@@ -61,9 +61,15 @@ namespace CNamePool
 constexpr std::uintptr_t get = 0x1402843a0 - image_base;
 constexpr std::uintptr_t add_wide = 0x14145a3a0 - image_base;
 
-// WARNING - STALE, as above. CNameHash::to_wide() depends on this, and so does
-// CClass::find_function(), which compares names as wide strings. Comparing
-// CNameHash indices directly would avoid the dependency entirely.
-constexpr std::uintptr_t find_wide = 0x1402E1540 - image_base;
+// Offset WITHIN the pool object, not an image address, so it needs no
+// relocation. Name-anchored: the tail of CNamePool::Add pushes the new entry
+// into `[pool + entry_array]` and then reads the count from eight bytes later
+// to derive the index, so w3offsets reads both displacements straight out of
+// that function.
+//
+// This replaces a stale `find_wide` call address. Reversing an index to text is
+// an array index, not a call - which is also bounds-checkable, where the call
+// was not.
+constexpr std::uintptr_t entry_array = 0x11830;
 } // namespace CNamePool
 } // namespace red3lib::detail::addresses
