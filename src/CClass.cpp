@@ -3,13 +3,14 @@
 
 red3lib::CFunction* red3lib::CClass::find_function(red3lib::CNameHash func_name) const
 {
-    // TODO: Improve this after some more RE is done.
-    for (uint32_t i = 0; i < functions.size; i++)
+    // Compare pool indices rather than strings. CNamePool::Add interns, so two
+    // equal names always share an index - this is exact, avoids materialising a
+    // wide string per entry, and keeps lookup off CNamePool::find_wide, which is
+    // not name-anchored and therefore goes stale on every game patch.
+    for (std::uint32_t i = 0; i < functions.size; i++)
     {
         auto function = functions.entries[i];
-        auto name1 = function->name.to_wide();
-        auto name2 = func_name.to_wide();
-        if (name1 == name2)
+        if (function->name == func_name)
         {
             return function;
         }

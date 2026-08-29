@@ -4,7 +4,7 @@ red3lib::CStackFrame::CStackFrame(CFunction* owner, IScriptable* context, std::u
                                   std::uint8_t* code) noexcept
     : context(context)
     , unk8(0)
-    , parent(parent)
+    , parent(nullptr)
     , owner(owner)
     , locals(locals)
     , params(params)

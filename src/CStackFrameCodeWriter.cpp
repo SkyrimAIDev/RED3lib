@@ -11,4 +11,5 @@ void red3lib::CStackFrameCodeWriter::write(CProperty* property)
     m_cursor++;
 
     *reinterpret_cast<CProperty**>(m_cursor) = property;
+    m_cursor += sizeof(CProperty*);
 }

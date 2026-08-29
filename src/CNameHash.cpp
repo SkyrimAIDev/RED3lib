@@ -2,11 +2,6 @@
 
 #include <red3lib/CNamePool.hpp>
 
-constexpr red3lib::CNameHash::CNameHash() noexcept
-    : m_index(0)
-{
-}
-
 red3lib::CNameHash::CNameHash(const wchar_t* text)
 {
     // TODO: Handle "None" -> set index = 0.
