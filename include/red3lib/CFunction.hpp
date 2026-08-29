@@ -288,11 +288,36 @@ inline R CFunction::call_native(IScriptable* context, Args&&... args)
 
     RED3LIB_ASSERT(impl);
 
+    // Out parameters. A native writes its results back into the params buffer,
+    // at the same offset its CProperty declares, so an argument passed as a
+    // non-const lvalue reference is refreshed from that buffer after the call.
+    // Passing by value opts out, which leaves every existing call unchanged.
+    //
+    // Whatever the engine allocated into an out parameter belongs to the
+    // engine - an out array's storage, and a reference on every handle it
+    // holds. Nothing here releases either.
+    auto read_back = [&](CProperty* property, auto&& value)
+    {
+        using argument = decltype(value);
+        using stored = std::remove_reference_t<argument>;
+
+        if constexpr (std::is_lvalue_reference_v<argument> && !std::is_const_v<stored>)
+        {
+            std::memcpy(&value, params_stack.get() + property->offset, sizeof(stored));
+        }
+    };
+
     if constexpr (std::is_same_v<R, void>)
     {
         if (impl)
         {
             impl(self, &frame, nullptr);
+        }
+
+        if constexpr (sizeof...(Args) > 0)
+        {
+            std::size_t out_index = 0;
+            (read_back(params.entries[out_index++], std::forward<Args>(args)), ...);
         }
     }
     else
@@ -301,6 +326,12 @@ inline R CFunction::call_native(IScriptable* context, Args&&... args)
         if (impl)
         {
             impl(self, &frame, &result);
+        }
+
+        if constexpr (sizeof...(Args) > 0)
+        {
+            std::size_t out_index = 0;
+            (read_back(params.entries[out_index++], std::forward<Args>(args)), ...);
         }
 
         return result;

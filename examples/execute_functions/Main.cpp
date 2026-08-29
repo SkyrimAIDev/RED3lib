@@ -19,6 +19,8 @@
 // primitive again to confirm the stack survived.
 
 #include <algorithm>
+#include <cmath>
+#include <initializer_list>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -440,6 +442,52 @@ struct engine_vector
     float w;
 };
 
+// A function's real signature. The RTTI dump records neither parameters nor
+// return types - both exist only at runtime, on the CProperty entries. The type
+// name comes from IRTTIType vtable slot 1, which returns a POINTER to the name.
+std::string type_name_of(red3lib::CProperty* property)
+{
+    if (!property || !property->type)
+    {
+        return "<none>";
+    }
+
+    const auto* name = property->type->name();
+    if (!name)
+    {
+        return "<unnamed>";
+    }
+
+    auto wide = name->to_wide();
+    return wide.empty() ? std::string("<empty>") : narrow(wide.data(), static_cast<std::uint32_t>(wide.size()));
+}
+
+void dump_signature(const char* indent, const char* label, red3lib::CFunction* fn)
+{
+    out << indent << label << "(";
+
+    for (std::uint32_t i = 0; i < fn->params.size; i++)
+    {
+        if (i)
+        {
+            out << ", ";
+        }
+
+        auto* property = fn->params.entries[i];
+        out << type_name_of(property);
+        if (property)
+        {
+            out << " @" << property->offset;
+        }
+    }
+
+    out << ") -> " << (fn->return_property ? type_name_of(fn->return_property) : std::string("void"))
+        << "   [stackSize=" << fn->stack_size << ", size=" << (fn->return_property && fn->return_property->type
+                                                                   ? fn->return_property->type->size()
+                                                                   : 0)
+        << "]" << std::endl;
+}
+
 red3lib::CClass* g_class = nullptr;
 red3lib::IScriptable* g_context = nullptr;
 
@@ -489,13 +537,19 @@ void run_round(int round)
 {
     out << "\n--- round " << round << " ---" << std::endl;
 
+    // Anything that cannot change between rounds, and anything that MUTATES
+    // game state, runs once. The rounds exist to watch state appear as the
+    // game loads - repeating the rest just leaks engine allocations and, in
+    // the case of Pause/Unpause, pokes a live session every few seconds.
+    const bool first = round == 1;
+
     if (auto* fn = resolve(g_class, L"GetEngineTimeAsSeconds"))
     {
         dump_meta("GetEngineTimeAsSeconds", fn);
         out << "  GetEngineTimeAsSeconds() = " << fn->call_native<float>(g_context) << std::endl;
     }
 
-    if (auto* fn = resolve(g_class, L"GetApplicationVersion"))
+    if (auto* fn = first ? resolve(g_class, L"GetApplicationVersion") : nullptr)
     {
         dump_meta("GetApplicationVersion", fn);
         auto version = fn->call_native<red3lib::String>(g_context);
@@ -507,7 +561,7 @@ void run_round(int round)
     // CStackFrameCodeWriter rejects them at compile time rather than letting the
     // call corrupt the code stream. GetTimeScale takes a bool, which encodes as
     // a 1-byte immediate.
-    if (auto* fn = resolve(g_class, L"GetTimeScale"))
+    if (auto* fn = first ? resolve(g_class, L"GetTimeScale") : nullptr)
     {
         dump_meta("GetTimeScale", fn);
         out << "  GetTimeScale(true) = " << fn->call_native<float>(g_context, true) << std::endl;
@@ -520,7 +574,7 @@ void run_round(int round)
     // produced. Pause keys on the string, so setting the state and reading it
     // back can only agree if the content survived both calls. Unpause restores
     // it either way.
-    if (auto* is_paused = resolve(g_class, L"IsPausedForReason"))
+    if (auto* is_paused = first ? resolve(g_class, L"IsPausedForReason") : nullptr)
     {
         dump_meta("IsPausedForReason", is_paused);
 
@@ -544,7 +598,7 @@ void run_round(int round)
         }
     }
 
-    if (auto* fn = resolve(g_class, L"IsSpecificRumbleActive"))
+    if (auto* fn = first ? resolve(g_class, L"IsSpecificRumbleActive") : nullptr)
     {
         dump_meta("IsSpecificRumbleActive", fn);
         out << "  IsSpecificRumbleActive(0, 0) = " << std::boolalpha << fn->call_native<bool>(g_context, 0.0f, 0.0f)
@@ -587,7 +641,7 @@ void run_round(int round)
     // the journal manager handle, reads its CClass from the object itself, and
     // resolves and calls one of ITS methods - which is what makes the whole
     // object graph reachable rather than just the game object.
-    if (auto* fn = resolve(g_class, L"GetJournalManager"))
+    if (auto* fn = first ? resolve(g_class, L"GetJournalManager") : nullptr)
     {
         auto handle = fn->call_native<red3lib::Handle<void>>(g_context);
         auto* object = handle.get();
@@ -610,6 +664,26 @@ void run_round(int round)
             else
             {
                 out << "    GetRegularQuestCount not found - class_of returned the wrong class" << std::endl;
+            }
+        }
+    }
+
+    // What do the enumeration natives actually take? The dump cannot say, so
+    // read it off the live CFunction.
+    //
+    // GetTimeScale and IsPausedForReason are controls: their parameter types
+    // are already known to be Bool and String, so if those two print correctly
+    // the rest of the reading can be trusted.
+    if (first)
+    {
+        out << "  signatures:" << std::endl;
+        for (const wchar_t* name : {L"GetTimeScale", L"IsPausedForReason", L"GetAllNPCs", L"GetNPCsByTag",
+                                    L"GetNPCByTag", L"GetJournalManager"})
+        {
+            if (auto* fn = resolve(g_class, name))
+            {
+                auto narrowed = narrow(name, static_cast<std::uint32_t>(wcslen(name)));
+                dump_signature("    ", narrowed.c_str(), fn);
             }
         }
     }
@@ -698,7 +772,16 @@ void run_round(int round)
             auto* cls = red3lib::class_of(player);
             auto* self = reinterpret_cast<red3lib::IScriptable*>(player);
 
-            for (const wchar_t* name : {L"GetName", L"GetDisplayName", L"GetTagsString"})
+            // Each of these returns an engine-allocated String that nothing here
+            // frees, so they run once rather than every round.
+            static bool described_player = false;
+            const bool describe_now = !described_player;
+            described_player = true;
+
+            const std::initializer_list<const wchar_t*> none{};
+            const std::initializer_list<const wchar_t*> names{L"GetName", L"GetDisplayName", L"GetTagsString"};
+
+            for (const wchar_t* name : describe_now ? names : none)
             {
                 auto* method = resolve(cls, name);
                 if (!method)
@@ -720,11 +803,105 @@ void run_round(int round)
                     << std::endl;
             }
 
+            const std::initializer_list<const wchar_t*> signature_names{L"GetEnemiesInRange"};
+
+            for (const wchar_t* name : describe_now ? signature_names : none)
+            {
+                if (auto* method = resolve(cls, name))
+                {
+                    auto narrowed = narrow(name, static_cast<std::uint32_t>(wcslen(name)));
+                    dump_signature("    ", narrowed.c_str(), method);
+                }
+            }
+
+            engine_vector player_position{};
+            bool have_player_position = false;
             if (auto* method = resolve(cls, L"GetWorldPosition"))
             {
-                auto position = method->call_native<engine_vector>(self);
-                out << "    GetWorldPosition() = " << position.x << ", " << position.y << ", " << position.z
-                    << std::endl;
+                player_position = method->call_native<engine_vector>(self);
+                have_player_position = true;
+                out << "    GetWorldPosition() = " << player_position.x << ", " << player_position.y << ", "
+                    << player_position.z << std::endl;
+            }
+
+            // Enumerating NPCs.
+            //
+            // GetAllNPCs takes one out parameter - a TDynArray of CNewNPC
+            // handles that the engine fills and owns. Its storage and a
+            // reference on every handle in it belong to the engine and nothing
+            // here releases either, so this runs ONCE rather than every round:
+            // holding references would keep despawned NPCs alive.
+            static bool enumerated = false;
+            if (!enumerated)
+            {
+                enumerated = true;
+
+                if (auto* fn = resolve(g_class, L"GetAllNPCs"))
+                {
+                    red3lib::TDynArray<red3lib::Handle<void>> npcs{};
+                    fn->call_native<void>(g_context, npcs);
+
+                    out << "    GetAllNPCs() filled " << npcs.size << " entries, storage "
+                        << static_cast<const void*>(npcs.entries) << std::endl;
+
+                    std::uint32_t shown = 0;
+                    for (std::uint32_t i = 0; i < npcs.size && shown < 15; i++)
+                    {
+                        auto* npc = npcs.entries[i].get();
+                        if (!npc || !readable(npc, 512))
+                        {
+                            continue;
+                        }
+
+                        auto* npc_class = red3lib::class_of(npc);
+                        if (!npc_class || !readable(npc_class, sizeof(red3lib::CClass)))
+                        {
+                            continue;
+                        }
+
+                        shown++;
+
+                        auto class_name = npc_class->name.to_wide();
+                        out << "      [" << i << "] "
+                            << narrow(class_name.data(), static_cast<std::uint32_t>(class_name.size()));
+
+                        auto* npc_self = reinterpret_cast<red3lib::IScriptable*>(npc);
+
+                        if (auto* method = npc_class->find_function(L"GetDisplayName"))
+                        {
+                            if (method->is_native())
+                            {
+                                auto text = method->call_native<red3lib::String>(npc_self);
+                                if (text.data)
+                                {
+                                    out << "  name=" << narrow(text.data, text.size ? text.size - 1 : 0);
+                                }
+                            }
+                        }
+
+                        if (have_player_position)
+                        {
+                            if (auto* method = npc_class->find_function(L"GetWorldPosition"))
+                            {
+                                if (method->is_native())
+                                {
+                                    auto at = method->call_native<engine_vector>(npc_self);
+                                    auto dx = at.x - player_position.x;
+                                    auto dy = at.y - player_position.y;
+                                    auto dz = at.z - player_position.z;
+                                    out << "  " << std::sqrt(dx * dx + dy * dy + dz * dz) << "m away";
+                                }
+                            }
+                        }
+
+                        out << std::endl;
+                    }
+
+                    if (npcs.size > shown)
+                    {
+                        out << "      (" << (npcs.size - shown) << " more not listed)" << std::endl;
+                    }
+                }
             }
         }
     }
