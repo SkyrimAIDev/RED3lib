@@ -34,8 +34,14 @@ struct CFunction : IRTTIBaseObject
         std::int32_t unk14;
         std::int64_t unk18;
         std::int64_t unk20;
-        std::int64_t unk28;
-        std::int32_t size;
+
+        // The scripted bytecode, at CFunction +0x80 and +0x88. The interpreter
+        // opens with `mov eax, [rcx+0x88]` / `add rax, [rcx+0x80]` and bails
+        // when the two are equal, then walks `code` to `code + code_size`
+        // dispatching each byte through the same table native argument fetches
+        // use.
+        std::uint8_t* code;     // CFunction +0x80
+        std::int32_t code_size; // CFunction +0x88
         std::int64_t unk38;
         std::int32_t unk40;
         std::int32_t unk44;
@@ -104,6 +110,14 @@ struct CFunction : IRTTIBaseObject
 
         return params.entries[index]->type;
     }
+
+    // Calls a SCRIPTED function - one with bytecode rather than a native
+    // implementation. Unlike a native call there is no code stream to build:
+    // the interpreter runs the function's own bytecode and allocates its own
+    // locals, so arguments only have to be laid out in the params buffer at the
+    // offsets their properties declare.
+    template<typename R, typename... Args>
+    R call_scripted(IScriptable* context, Args&&... args);
 
     [[nodiscard]] bool is_native() const noexcept
     {
@@ -206,24 +220,87 @@ inline R CFunction::execute_native(IScriptable* context, Args&&... args)
 template<typename R, typename... Args>
 inline R CFunction::execute_scripted(IScriptable* context, Args&&... args)
 {
-    constexpr auto args_total_size = (0 + ... + sizeof(Args));
-    std::array<std::uint8_t, args_total_size + 1> params_stack{};
+    return call_scripted<R>(context, std::forward<Args>(args)...);
+}
 
-    CStackFrameParamWriter writer(params_stack.data());
-    (writer.write(std::forward<Args>(args)), ...);
-    writer.write_end();
+template<typename R, typename... Args>
+inline R CFunction::call_scripted(IScriptable* context, Args&&... args)
+{
+    RED3LIB_ASSERT(!is_native());
+    RED3LIB_ASSERT(params.size == sizeof...(args));
 
-    detail::RelocFunc<bool, CFunction*, IScriptable*, std::uint8_t*, R*> func(
+    // Sized from the function's own stack_size, exactly as the engine does it -
+    // `mov ecx, [fn+0x50]`, round up, allocate - and NOT from the C++ argument
+    // sizes. Arguments are not packed sequentially; each goes where its property
+    // says, which is the same mistake that made the native path drop arguments.
+    auto params_size = static_cast<std::size_t>(stack_size) + 1;
+    auto params_ptr = reinterpret_cast<std::uint8_t*>(_malloca(params_size));
+    RED3LIB_ASSERT(params_ptr);
+    if (!params_ptr)
+    {
+        if constexpr (std::is_same_v<R, void>)
+        {
+            return;
+        }
+        else
+        {
+            return R{};
+        }
+    }
+
+    std::memset(params_ptr, 0, params_size);
+    std::unique_ptr<std::uint8_t, decltype(&_freea)> params_stack(params_ptr, &_freea);
+
+    std::size_t index = 0;
+    (
+        [&]
+        {
+            auto* property = params.entries[index++];
+            if (property)
+            {
+                std::memcpy(params_stack.get() + property->offset, &args, sizeof(args));
+            }
+        }(),
+        ...);
+
+    // (function, context, params, result). Read off the interpreter's prologue:
+    // rcx is the function - it reads code_size at +0x88 and stack_size at +0x50
+    // from it - rdx becomes the frame's context, r8 the frame's params, and r9
+    // receives the return value.
+    detail::RelocFunc<void, CFunction*, IScriptable*, void*, void*> func(
         detail::addresses::CFunction::execute_scripted);
+
+    auto read_back = [&](CProperty* property, auto&& value)
+    {
+        using argument = decltype(value);
+        using stored = std::remove_reference_t<argument>;
+
+        if constexpr (std::is_lvalue_reference_v<argument> && !std::is_const_v<stored>)
+        {
+            std::memcpy(&value, params_stack.get() + property->offset, sizeof(stored));
+        }
+    };
 
     if constexpr (std::is_same_v<R, void>)
     {
-        func(this, context, params_stack.data(), nullptr);
+        func(this, context, params_stack.get(), nullptr);
+
+        if constexpr (sizeof...(Args) > 0)
+        {
+            std::size_t out_index = 0;
+            (read_back(params.entries[out_index++], std::forward<Args>(args)), ...);
+        }
     }
     else
     {
         R result{};
-        func(this, context, params_stack.data(), &result);
+        func(this, context, params_stack.get(), &result);
+
+        if constexpr (sizeof...(Args) > 0)
+        {
+            std::size_t out_index = 0;
+            (read_back(params.entries[out_index++], std::forward<Args>(args)), ...);
+        }
 
         return result;
     }

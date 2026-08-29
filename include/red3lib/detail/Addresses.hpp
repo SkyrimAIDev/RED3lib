@@ -43,16 +43,19 @@ constexpr std::uintptr_t class_method_table = 0x1457d5890 - image_base;
 // Name-anchored. Kept for reference - CFunction::call_native does not need it.
 constexpr std::uintptr_t register_native = 0x141496fa0 - image_base;
 
-// WARNING - STALE. These target a different 4.00 build and have NOT been
-// re-derived for 4.0.0.103190. They are not reachable from a name anchor (the
-// functions are not virtual: CFunction's vtable holds only its destructor), so
-// w3offsets.py cannot regenerate them.
-//
-// CFunction::execute() calls these and will jump into the wrong code on any
-// build but the original. Use CFunction::call_native() instead until they are
-// resolved for your build.
+// WARNING - STALE. Targets a different 4.00 build and has NOT been re-derived.
+// call_native() replaces it and nothing uses it.
 constexpr std::uintptr_t execute_native = 0x1402FD190 - image_base;
-constexpr std::uintptr_t execute_scripted = 0x1402FD880 - image_base;
+
+// The scripted-function interpreter. Re-derived for this build and reachable
+// without a name: it is the only function in the image containing
+// `add rax, qword ptr [rcx + 0x80]` - CFunction's bytecode pointer - so
+// w3offsets anchors on that single occurrence and walks back to the prologue.
+//
+// Called as (CFunction*, IScriptable* context, void* params, void* result). It
+// runs the function's own bytecode and allocates its own locals from
+// stack_size, so unlike a native call there is no code stream to synthesise.
+constexpr std::uintptr_t execute_scripted = 0x141496020 - image_base;
 } // namespace CFunction
 
 namespace CNamePool

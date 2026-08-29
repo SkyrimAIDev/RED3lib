@@ -1050,6 +1050,44 @@ void run_round(int round)
                 out << "  ShowOneliner found, native = " << std::boolalpha << method->is_native() << std::endl;
                 dump_signature("    ", "ShowOneliner", method);
             }
+
+            // Calling a SCRIPTED function.
+            //
+            // Everything called so far has been native. CR4ScriptedHud carries
+            // 104 scripted functions against the dump's 4, and the game's logic
+            // lives in classes like this, so reaching them roughly doubles what
+            // is callable.
+            //
+            // Safest first, each logged and flushed before the call.
+            auto* hud_self = reinterpret_cast<red3lib::IScriptable*>(hud->get());
+
+            if (auto* method = hud_class->find_function(L"IsHudVisibilityAllowedByUser"))
+            {
+                if (!method->is_native() && method->params.size == 0)
+                {
+                    out << "  calling SCRIPTED IsHudVisibilityAllowedByUser ..." << std::endl;
+                    const auto allowed = method->call_scripted<bool>(hud_self);
+                    out << "    -> " << std::boolalpha << allowed << std::endl;
+                }
+            }
+
+            // Discriminating: a scripted function whose result must vary with
+            // its arguments. Equal outputs for different inputs would mean the
+            // arguments are not arriving, the same trap the native path had.
+            if (auto* method = hud_class->find_function(L"GetScaleformPoint"))
+            {
+                if (!method->is_native() && method->params.size == 2)
+                {
+                    out << "  calling SCRIPTED GetScaleformPoint ..." << std::endl;
+                    const auto origin = method->call_scripted<engine_vector>(hud_self, 0.0f, 0.0f);
+                    const auto offset = method->call_scripted<engine_vector>(hud_self, 100.0f, 200.0f);
+
+                    const bool differs = origin.x != offset.x || origin.y != offset.y;
+                    out << "    (0,0) -> " << origin.x << ", " << origin.y << "   (100,200) -> " << offset.x << ", "
+                        << offset.y << (differs ? "   <-- DIFFERS, scripted arguments delivered" : "   (identical)")
+                        << std::endl;
+                }
+            }
         }
 
         // The call itself happens in the enumeration below, where an NPC handle
