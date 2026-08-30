@@ -1060,7 +1060,17 @@ void red3lib_ping(red3lib::IScriptable*, red3lib::CStackFrame*, void* result)
     }
 }
 
-void probe_call_in()
+// Registration must happen at PLUGIN LOAD, not in-world.
+//
+// The compiler binds `import function` by name while compiling scripts, and it
+// only ever looks once. Registering afterwards publishes into a registry the
+// compiler has already finished with - the mechanism works, but no import can
+// bind to it. Plugin load is early enough: at that moment CR4Game's class has 0
+// functions, so the engine has not even registered its own natives yet.
+red3lib::CFunction* g_ping_function = nullptr;
+red3lib::CNameHash g_ping_name;
+
+void register_call_in()
 {
     // Storage the engine does NOT own: the registrars take a caller-provided
     // block and never free it. Static, so it outlives every call.
@@ -1075,6 +1085,7 @@ void probe_call_in()
     registered = true;
 
     red3lib::CNameHash name(L"RED3lib_Ping");
+    g_ping_name = name;
 
     red3lib::detail::RelocFunc<red3lib::CFunction*, void*, const red3lib::CNameHash*,
                                red3lib::CFunction::native_fn_t>
@@ -1083,6 +1094,7 @@ void probe_call_in()
     out << "  call-in: registering RED3lib_Ping ..." << std::endl;
 
     auto* fn = register_global(storage, &name, &red3lib_ping);
+    g_ping_function = fn;
 
     if (!fn)
     {
@@ -1170,7 +1182,50 @@ void probe_call_in()
     }
 
     out << "    compiler-style lookup by name: " << static_cast<const void*>(found)
-        << (found == fn ? "   <-- FOUND, an import would bind to it" : "   <-- NOT FOUND") << std::endl;
+        << (found == fn ? "   <-- FOUND, an import can bind to it" : "   <-- NOT FOUND") << std::endl;
+}
+
+// Did the compiler actually bind the `import function` declaration to us?
+//
+// This is the discriminating check, and it needs nothing on screen and no
+// console. If an import bound, the COMPILER filled in the signature on OUR
+// CFunction - the same object registered at load, living in this DLL. A
+// return_property that was null at registration and is typed afterwards can only
+// have been written by the compiler.
+void verify_call_in()
+{
+    if (!g_ping_function)
+    {
+        out << "  call-in: never registered" << std::endl;
+        return;
+    }
+
+    out << "  call-in: our CFunction " << static_cast<const void*>(g_ping_function) << " after script compilation:"
+        << std::endl;
+    out << "    params=" << g_ping_function->params.size
+        << "  return_property=" << static_cast<const void*>(g_ping_function->return_property)
+        << "  flags=0x" << std::hex << g_ping_function->flags << std::dec << std::endl;
+
+    if (g_ping_function->return_property)
+    {
+        out << "    return type = " << type_name_of(g_ping_function->return_property)
+            << "   <-- THE COMPILER BOUND OUR IMPORT" << std::endl;
+    }
+    else
+    {
+        out << "    return_property still null - no import bound to it" << std::endl;
+    }
+
+    // Still in the registry after the engine finished its own registration?
+    red3lib::detail::RelocFunc<std::uint8_t*> rtti_registry(red3lib::detail::addresses::CFunction::rtti_registry);
+    auto* registry = rtti_registry();
+    if (registry && readable(registry, 0x68))
+    {
+        out << "    registry now holds " << *reinterpret_cast<const std::uint32_t*>(registry + 0x44) << " functions"
+            << std::endl;
+    }
+
+    out << "    our native has been called " << g_ping_calls << " time(s) so far" << std::endl;
 }
 
 // One round of probes. Repeated as the game progresses: values that are zero at
@@ -1383,7 +1438,7 @@ void run_round(int round)
         // from zero means the compiler ran AFTER we loaded, and registration at
         // load time is early enough to be seen.
         snapshot_script_state("in world");
-        probe_call_in();
+        verify_call_in();
     }
 
     // Text output: what can actually put words on screen.
@@ -1904,6 +1959,7 @@ RED3LIB_C_EXPORT bool RED3LIB_CALL Main(HMODULE aHandle, EMainReason aReason)
         // Taken as early as a plugin can run, before anything else here touches
         // the engine.
         snapshot_script_state("at plugin load");
+        register_call_in();
         break;
     }
     case EMainReason::Unload:
