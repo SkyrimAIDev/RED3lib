@@ -60,6 +60,18 @@ constexpr std::uintptr_t register_native = 0x141496fa0 - image_base;
 // The registry is a hash map: bucket count at +0x40, entry count at +0x44,
 // buckets at +0x60. An entry is { key, CFunction* value at +0x08, key again at
 // +0x10, next at +0x18 }.
+// The script compilation entry, and the window call-in registration belongs in.
+//
+// Registering at plugin LOAD crashes: the registrar touches the shared counter
+// and an allocator the engine has not stood up yet. Registering in-world is safe
+// but useless for binding - the compiler has already run. This function's entry
+// is between the two: the engine has registered its own natives by then, and no
+// import has been bound yet.
+//
+// Anchored on the compiler's first progress message, "Compiling scripts (finding
+// script files)...", which only the compile routine mentions.
+constexpr std::uintptr_t compile_scripts = 0x1414e1050 - image_base;
+
 constexpr std::uintptr_t rtti_registry = 0x140285d60 - image_base;
 constexpr std::uintptr_t publish_global = 0x14146a5f0 - image_base;
 
