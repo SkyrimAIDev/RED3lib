@@ -1135,8 +1135,26 @@ dialogue_line g_dialogue;
 // wrote. If our own C++ runs and returns its value, the path is proven.
 std::int32_t g_ping_calls = 0;
 
-void red3lib_ping(red3lib::IScriptable*, red3lib::CStackFrame*, void* result)
+void red3lib_ping(red3lib::IScriptable*, red3lib::CStackFrame* frame, void* result)
 {
+    // Step the frame's code pointer past the end-of-params marker.
+    //
+    // This is not optional and it is not bookkeeping. Every engine native ends
+    // its argument fetching with `inc qword ptr [frame+0x30]` - one byte, once,
+    // after the last fetch - and a native taking no arguments still owes that
+    // advance. It is the same byte CStackFrameCodeWriter now emits from
+    // end_params().
+    //
+    // Omitting it was invisible while only call_native reached this function,
+    // because that builds a throwaway frame and discards it. When compiled
+    // script bytecode calls in, the frame is the VM's real one: leaving the code
+    // pointer one byte short makes the interpreter resume inside an instruction,
+    // and it crashed the game.
+    if (frame)
+    {
+        frame->code++;
+    }
+
     g_ping_calls++;
 
     if (result)
