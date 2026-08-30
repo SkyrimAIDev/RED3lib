@@ -1438,6 +1438,11 @@ void run_round(int round)
         // from zero means the compiler ran AFTER we loaded, and registration at
         // load time is early enough to be seen.
         snapshot_script_state("in world");
+
+        // Back to registering in-world, which is proven safe. An import cannot
+        // bind to this - the compiler has long finished - so it demonstrates the
+        // mechanism, not the integration.
+        register_call_in();
         verify_call_in();
     }
 
@@ -1959,7 +1964,22 @@ RED3LIB_C_EXPORT bool RED3LIB_CALL Main(HMODULE aHandle, EMainReason aReason)
         // Taken as early as a plugin can run, before anything else here touches
         // the engine.
         snapshot_script_state("at plugin load");
-        register_call_in();
+
+        // Registering HERE crashes the game.
+        //
+        // register_global faulted at plugin load: the log printed the line
+        // before the call and nothing after, and RED3ext's own log stops at
+        // "starting up" without ever reaching "plugin(s) loaded". CNamePool
+        // survives this early - the CNameHash above it was constructed fine -
+        // but the registrar does not. It touches the shared registration counter
+        // and calls an allocator that the engine has not stood up yet, which
+        // fits CR4Game's class holding 0 functions at this point: nothing has
+        // registered anything.
+        //
+        // So "plugins load before script compilation" is true and not enough.
+        // What is needed is a window AFTER the engine registers its own natives
+        // and BEFORE the compiler runs, and plugin load is on the wrong side of
+        // the first boundary.
         break;
     }
     case EMainReason::Unload:
