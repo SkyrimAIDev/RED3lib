@@ -520,6 +520,91 @@ red3lib::IScriptable* g_context = nullptr;
 
 // Locate the class and the live instance. Cached: the address-space scan is
 // expensive and must not be repeated once it has succeeded.
+void register_call_in();
+
+// Hooking script compilation, which is the only window call-in can use.
+//
+// Registering at plugin load faults - the engine has not stood up the allocator
+// the registrar needs. Registering in-world is safe but the compiler has already
+// bound every import. The compile routine's own entry sits between the two.
+//
+// The patch is 14 bytes and that is not a coincidence: the prologue is
+//
+//     44 88 44 24 18    mov byte ptr [rsp+0x18], r8b    5
+//     48 89 54 24 10    mov qword ptr [rsp+0x10], rdx   5
+//     55 53 56 57       push rbp / rbx / rsi / rdi      4
+//
+// exactly the width of an absolute `jmp [rip+0]`, and exactly on an instruction
+// boundary, so relocating it needs no instruction rewriting.
+constexpr std::uintptr_t compile_scripts_offset = 0x1414e1050 - 0x140000000;
+
+using compile_scripts_fn = std::uint64_t (*)(void*, void*, std::uint64_t);
+compile_scripts_fn g_compile_original = nullptr;
+
+std::uint64_t compile_scripts_detour(void* a, void* b, std::uint64_t c)
+{
+    out << "  compile hook: script compilation starting - registering now" << std::endl;
+    register_call_in();
+
+    return g_compile_original(a, b, c);
+}
+
+bool install_compile_hook()
+{
+    auto* target = reinterpret_cast<std::uint8_t*>(GetModuleHandle(nullptr)) + compile_scripts_offset;
+    constexpr std::size_t patch_size = 14;
+
+    // Refuse to patch anything that is not the prologue that was disassembled.
+    // A wrong address here corrupts the game's code and it will not start, so
+    // this compares before it writes rather than trusting the offset.
+    static const std::uint8_t expected[patch_size] = {0x44, 0x88, 0x44, 0x24, 0x18, 0x48, 0x89,
+                                                      0x54, 0x24, 0x10, 0x55, 0x53, 0x56, 0x57};
+
+    if (!readable(target, patch_size) || std::memcmp(target, expected, patch_size) != 0)
+    {
+        out << "  compile hook: prologue does not match, NOT patching" << std::endl;
+        return false;
+    }
+
+    auto* trampoline = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!trampoline)
+    {
+        out << "  compile hook: could not allocate a trampoline" << std::endl;
+        return false;
+    }
+
+    // The original 14 bytes, then an absolute jump back to what follows them.
+    std::memcpy(trampoline, target, patch_size);
+    const auto resume = reinterpret_cast<std::uint64_t>(target + patch_size);
+    trampoline[patch_size + 0] = 0xFF;
+    trampoline[patch_size + 1] = 0x25;
+    std::memset(trampoline + patch_size + 2, 0, 4);
+    std::memcpy(trampoline + patch_size + 6, &resume, sizeof(resume));
+
+    g_compile_original = reinterpret_cast<compile_scripts_fn>(trampoline);
+
+    DWORD previous = 0;
+    if (!VirtualProtect(target, patch_size, PAGE_EXECUTE_READWRITE, &previous))
+    {
+        out << "  compile hook: VirtualProtect failed" << std::endl;
+        return false;
+    }
+
+    const auto detour = reinterpret_cast<std::uint64_t>(&compile_scripts_detour);
+    target[0] = 0xFF;
+    target[1] = 0x25;
+    std::memset(target + 2, 0, 4);
+    std::memcpy(target + 6, &detour, sizeof(detour));
+
+    VirtualProtect(target, patch_size, previous, &previous);
+    FlushInstructionCache(GetCurrentProcess(), target, patch_size);
+
+    out << "  compile hook: installed at " << static_cast<const void*>(target) << ", trampoline "
+        << static_cast<const void*>(trampoline) << std::endl;
+    return true;
+}
+
 // Are we registered before scripts compile?
 //
 // The compiler binds `import function` by name at script-compile time, so a
@@ -1439,9 +1524,8 @@ void run_round(int round)
         // load time is early enough to be seen.
         snapshot_script_state("in world");
 
-        // Back to registering in-world, which is proven safe. An import cannot
-        // bind to this - the compiler has long finished - so it demonstrates the
-        // mechanism, not the integration.
+        // A fallback only. register_call_in is idempotent, so if the hook fired
+        // during compilation this does nothing and the log shows which path ran.
         register_call_in();
         verify_call_in();
     }
@@ -1964,6 +2048,10 @@ RED3LIB_C_EXPORT bool RED3LIB_CALL Main(HMODULE aHandle, EMainReason aReason)
         // Taken as early as a plugin can run, before anything else here touches
         // the engine.
         snapshot_script_state("at plugin load");
+
+        // Installing the hook here is safe - it only writes bytes. The
+        // registration it performs happens later, when compilation starts.
+        install_compile_hook();
 
         // Registering HERE crashes the game.
         //
