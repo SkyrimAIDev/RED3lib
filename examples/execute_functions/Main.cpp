@@ -1311,6 +1311,63 @@ void verify_call_in()
     }
 
     out << "    our native has been called " << g_ping_calls << " time(s) so far" << std::endl;
+
+    // Now the other direction: does compiled WitcherScript actually CALL it?
+    //
+    // Binding is not calling. Everything above proves the compiler resolved the
+    // declaration; none of it proves a single script instruction ever reaches
+    // our C++. The .ws defines a scripted wrapper returning RED3lib_Ping() + 1,
+    // so the result discriminates: the native alone returns 0x5ED3, and only
+    // script bytecode that ran AND reached the native produces 0x5ED4.
+    //
+    // Script-defined globals live in the same registry we published into, so the
+    // wrapper is found the same way.
+    red3lib::CNameHash wrapper_name(L"RED3lib_ScriptCallsNative");
+
+    struct registry_entry
+    {
+        std::uint32_t key;
+        std::uint32_t unk04;
+        red3lib::CFunction* fn;
+        std::uint32_t key_again;
+        std::uint32_t unk14;
+        registry_entry* next;
+    };
+
+    const auto buckets = *reinterpret_cast<const std::uint32_t*>(registry + 0x40);
+    auto* const* table = *reinterpret_cast<registry_entry* const* const*>(registry + 0x60);
+    red3lib::CFunction* wrapper = nullptr;
+
+    if (buckets && table)
+    {
+        for (auto* entry = table[wrapper_name.index() % buckets]; entry; entry = entry->next)
+        {
+            if (entry->key == wrapper_name.index())
+            {
+                wrapper = entry->fn;
+                break;
+            }
+        }
+    }
+
+    if (!wrapper)
+    {
+        out << "    RED3lib_ScriptCallsNative not in the registry - the .ws did not compile it" << std::endl;
+        return;
+    }
+
+    out << "    found scripted RED3lib_ScriptCallsNative at " << static_cast<const void*>(wrapper)
+        << ", native=" << std::boolalpha << wrapper->is_native() << std::endl;
+
+    const auto before = g_ping_calls;
+    const auto answer = wrapper->call_scripted<std::int32_t>(nullptr);
+
+    out << "    it returned 0x" << std::hex << answer << std::dec << ", our native ran "
+        << (g_ping_calls - before) << " more time(s)"
+        << ((answer == 0x5ED4 && g_ping_calls == before + 1)
+                ? "   <-- SCRIPT CALLED OUR C++"
+                : "   <-- not the round trip")
+        << std::endl;
 }
 
 // One round of probes. Repeated as the game progresses: values that are zero at
